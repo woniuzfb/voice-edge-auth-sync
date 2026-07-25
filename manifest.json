@@ -1,0 +1,33 @@
+{
+  "manifest_version": 2,
+  "name": "Voice Edge Auth Sync",
+  "version": "1.1.0",
+  "description": "Synchronizes Doubao authentication and Qwen verification cookies with the local Voice Edge service.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "voice-edge-auth-sync@local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "cookies",
+    "tabs",
+    "notifications",
+    "nativeMessaging",
+    "webRequest",
+    "webRequestBlocking",
+    "https://doubao.com/*",
+    "https://www.doubao.com/*",
+    "https://chat.qwen.ai/*",
+    "https://*.qwen.ai/*",
+    "https://*.qianwen.com/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_action": {
+    "default_title": "Voice Edge Auth Sync"
+  }
+}
