@@ -1,12 +1,12 @@
 {
   "manifest_version": 2,
   "name": "Voice Edge Auth Sync",
-  "version": "1.1.0",
-  "description": "Synchronizes Doubao authentication and Qwen verification cookies with the local Voice Edge service.",
+  "version": "1.2.0",
+  "description": "Syncs Doubao / Qwen / DeepSeek browser sessions to Voice Edge, with a status panel that shows live and persisted conversation state and can start a new conversation per provider.",
   "browser_specific_settings": {
     "gecko": {
       "id": "voice-edge-auth-sync@local",
-      "strict_min_version": "109.0"
+      "strict_min_version": "115.0"
     }
   },
   "permissions": [
@@ -16,18 +16,36 @@
     "nativeMessaging",
     "webRequest",
     "webRequestBlocking",
-    "https://doubao.com/*",
     "https://www.doubao.com/*",
+    "https://*.doubao.com/*",
     "https://chat.qwen.ai/*",
     "https://*.qwen.ai/*",
-    "https://*.qianwen.com/*"
+    "https://chat.deepseek.com/*",
+    "https://*.deepseek.com/*"
   ],
   "background": {
-    "scripts": [
-      "background.js"
-    ]
+    "scripts": ["background.js"]
   },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content-deepseek.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "browser_action": {
-    "default_title": "Voice Edge Auth Sync"
+    "default_title": "Voice Edge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
   }
 }

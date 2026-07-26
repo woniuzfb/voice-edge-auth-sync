@@ -20,6 +20,13 @@ let qwenPollTimer = null;
 const QWEN_NOTIFICATION_ID = "voice-edge-qwen-verification";
 const QWEN_POLL_INTERVAL_MS = 1000;
 const QWEN_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+const DEEPSEEK_NOTIFICATION_ID = "voice-edge-deepseek-login";
+let deepseekState = null;
+let deepseekPollTimer = null;
+let deepseekAuthorization = "";
+let deepseekHifLeim = "";
+let lastStateReport = null;
+let lastStateRequestAt = 0;
 
 function compactError(error) {
   return String(error && (error.message || error) || "unknown error")
@@ -64,8 +71,13 @@ function connectNative() {
     const port = browser.runtime.connectNative(NATIVE_HOST);
     nativePort = port;
     port.onMessage.addListener(handleNativeMessage);
-    port.onDisconnect.addListener(() => {
+    port.onDisconnect.addListener(async () => {
+      const error = browser.runtime.lastError;
       nativePort = null;
+      await setBadge("!", "#d93025");
+      if (error && error.message) {
+        await notify("Voice Edge Native Host 已断开", compactError(error.message));
+      }
       scheduleReconnect();
     });
     port.postMessage({type: "PING"});
@@ -232,7 +244,102 @@ async function beginQwenVerification(message) {
   }, QWEN_POLL_INTERVAL_MS);
 }
 
+browser.webRequest.onBeforeSendHeaders.addListener(
+  details => {
+    for (const header of details.requestHeaders || []) {
+      const name = String(header.name || "").toLowerCase();
+      const value = String(header.value || "").trim();
+      if (name === "authorization" && value.toLowerCase().startsWith("bearer ")) deepseekAuthorization = value;
+      if (name === "x-hif-leim" && value) deepseekHifLeim = value;
+    }
+  },
+  {urls: ["https://chat.deepseek.com/api/v0/*"]},
+  ["requestHeaders"]
+);
+async function chooseDeepSeekCookieStore() {
+  const tabs = await browser.tabs.query({url: ["https://chat.deepseek.com/*"]});
+  const active = tabs.find(tab => tab.active) || tabs[0];
+  return {tabId: active ? active.id : null, storeId: active ? (active.cookieStoreId || "") : ""};
+}
+async function collectDeepSeekCookies(state) {
+  const query = {domain: "deepseek.com"};
+  if (state.cookieStoreId) query.storeId = state.cookieStoreId;
+  return (await browser.cookies.getAll(query)).map(c => normalizeCookie(c, state.cookieStoreId));
+}
+async function sendDeepSeekSnapshot() {
+  if (!deepseekState || deepseekState.syncInFlight) return;
+  const cookies = await collectDeepSeekCookies(deepseekState);
+  if (!cookies.length) throw new Error("未捕获到 DeepSeek Cookie");
+  if (!deepseekAuthorization.toLowerCase().startsWith("bearer ")) throw new Error("未捕获到 DeepSeek Authorization；请刷新页面或新建会话");
+  const port = connectNative();
+  if (!port) throw new Error("无法连接 Voice Edge Native Host");
+  deepseekState.syncInFlight = true;
+  await setBadge("…", "#1a73e8");
+  port.postMessage({type:"AUTH_SNAPSHOT", provider:"deepseek", captured_at:Date.now(),
+    cookie_store_id:deepseekState.cookieStoreId || "", cookies,
+    authorization:deepseekAuthorization, x_hif_leim:deepseekHifLeim || ""});
+}
+async function pollDeepSeekAuth() {
+  if (!deepseekState || deepseekState.syncInFlight) return;
+  if (Date.now() - deepseekState.startedAt > 10 * 60 * 1000) {
+    clearInterval(deepseekPollTimer); deepseekPollTimer = null;
+    await setBadge("!", "#d93025");
+    await notify("Voice Edge：DeepSeek 登录超时", "请重新触发认证后再试。"); return;
+  }
+  const cookies = await collectDeepSeekCookies(deepseekState);
+  const hasCookies = cookies.some(cookie => cookie && cookie.name && cookie.value);
+  const hasAuthorization = deepseekAuthorization.toLowerCase().startsWith("bearer ");
+  if (!hasCookies || !hasAuthorization) return;
+
+  // AUTH_REQUIRED means the server needs a usable snapshot now. Do not wait
+  // for Cookie/Authorization to differ from the baseline: Firefox may already
+  // hold a valid logged-in DeepSeek session when the request arrives.
+  clearInterval(deepseekPollTimer); deepseekPollTimer = null;
+  await sendDeepSeekSnapshot();
+}
+async function beginDeepSeekLogin(message) {
+  if (deepseekPollTimer) clearInterval(deepseekPollTimer);
+  const selected = await chooseDeepSeekCookieStore();
+  deepseekState = {cookieStoreId:selected.storeId, tabId:selected.tabId, startedAt:Date.now(),
+    loginUrl:String(message.login_url || "https://chat.deepseek.com/"), syncInFlight:false,
+    baselineAuthorization:deepseekAuthorization, baselineFingerprint:""};
+  deepseekState.baselineFingerprint = cookieFingerprint(await collectDeepSeekCookies(deepseekState));
+  await setBadge("!", "#d93025");
+  await browser.notifications.create(DEEPSEEK_NOTIFICATION_ID,{type:"basic",title:"Voice Edge：DeepSeek 需要认证",message:"正在检查当前 Firefox 登录状态；若未登录，请点击通知打开 DeepSeek。"});
+
+  // Try immediately. Previously the extension required credentials to change
+  // after AUTH_REQUIRED, so an already logged-in browser stayed red forever.
+  await pollDeepSeekAuth();
+  if (deepseekState && !deepseekState.syncInFlight && !deepseekPollTimer) {
+    deepseekPollTimer = setInterval(() => pollDeepSeekAuth().catch(async e => {
+      await setBadge("!", "#d93025");
+      await notify("Voice Edge DeepSeek 同步失败", compactError(e));
+    }), 1000);
+  }
+}
+browser.runtime.onMessage.addListener(message => {
+  if (!message || message.type !== "DEEPSEEK_CONVERSATION_SNAPSHOT") return;
+  const port = connectNative();
+  if (!port) return;
+  port.postMessage({
+    type: "CONVERSATION_SNAPSHOT",
+    provider: "deepseek",
+    conversation_id: String(message.conversation_id || ""),
+    model_type: String(message.model_type || ""),
+    page_url: String(message.page_url || ""),
+    captured_at: Number(message.captured_at || Date.now())
+  });
+});
+
 browser.notifications.onClicked.addListener(async notificationId => {
+  if (notificationId === DEEPSEEK_NOTIFICATION_ID) {
+    try {
+      const options={url:deepseekState ? deepseekState.loginUrl : "https://chat.deepseek.com/",active:true};
+      if (deepseekState && deepseekState.cookieStoreId) options.cookieStoreId=deepseekState.cookieStoreId;
+      await browser.tabs.create(options);
+    } catch (error) { await notify("Voice Edge：无法打开 DeepSeek",compactError(error)); }
+    return;
+  }
   if (notificationId === QWEN_NOTIFICATION_ID) {
     try {
       await openQwenVerification();
@@ -245,6 +352,22 @@ browser.notifications.onClicked.addListener(async notificationId => {
 async function handleNativeMessage(message) {
   if (!message || typeof message !== "object") return;
   const type = String(message.type || "");
+  if (type === "PONG" || type === "CONVERSATION_APPLIED") return;
+  if (type === "STATE_REPORT") { lastStateReport = message; return; }
+  if (type === "AUTH_REQUIRED" && message.provider === "deepseek") {
+    try { await beginDeepSeekLogin(message); }
+    catch (error) { await setBadge("!", "#d93025"); await notify("Voice Edge：DeepSeek 登录准备失败", compactError(error)); }
+    return;
+  }
+  if (type === "AUTH_APPLIED" && message.provider === "deepseek") {
+    if (deepseekState) deepseekState.syncInFlight=false;
+    if (message.success) {
+      await setBadge(message.validated ? "✓" : "↻", message.validated ? "#188038" : "#f9ab00");
+      await notify("Voice Edge：DeepSeek 同步完成", message.validated ? "认证已验证，请重试请求。" : "认证已保存，请重试请求。");
+      deepseekState=null; setTimeout(()=>setBadge("",null),5000);
+    } else await setBadge("!","#d93025");
+    return;
+  }
   if (type === "AUTH_REQUIRED" && message.provider === "qwen") {
     try {
       await beginQwenVerification(message);
@@ -308,6 +431,10 @@ async function handleNativeMessage(message) {
   }
 
   if (type === "AUTH_ERROR") {
+    if (message.provider === "deepseek") {
+      if (deepseekState) deepseekState.syncInFlight=false;
+      await setBadge("!","#d93025"); await notify("Voice Edge DeepSeek 同步失败",compactError(message.message)); return;
+    }
     if (message.provider === "qwen") {
       if (qwenState) qwenState.syncInFlight = false;
       await setBadge("!", "#d93025");
@@ -606,3 +733,128 @@ browser.browserAction.onClicked.addListener(async () => {
 });
 
 connectNative();
+
+/* ==== Voice Edge popup panel bridge (state round-trip to Voice Edge) ==== */
+let lastDeepSeekSnapshot = null;
+
+const POPUP_OPEN_URLS = {
+  deepseek: "https://chat.deepseek.com/",
+  qwen: "https://chat.qwen.ai/",
+  doubao: "https://www.doubao.com/chat/"
+};
+
+function popupSafeHost(url) {
+  try { return new URL(String(url || "")).hostname || ""; } catch (_) { return ""; }
+}
+
+// Ask Voice Edge (via the native host) for a secret-free persistent-state
+// summary. The reply arrives asynchronously as a STATE_REPORT native message
+// and is cached in lastStateReport; the panel auto-refreshes to pick it up.
+function requestBrowserState(force) {
+  const now = Date.now();
+  if (!force && now - lastStateRequestAt < 1200) return;
+  lastStateRequestAt = now;
+  const port = connectNative();
+  if (!port) return;
+  try { port.postMessage({ type: "STATE_QUERY" }); } catch (_) {}
+}
+
+function popupBuildState() {
+  const auth = (deepseekAuthorization || "").toLowerCase().startsWith("bearer ");
+  return {
+    ok: true,
+    generatedAt: Date.now(),
+    native: { connected: Boolean(nativePort), host: NATIVE_HOST },
+    deepseek: {
+      pending: Boolean(deepseekState),
+      authorizationCaptured: auth,
+      hifCaptured: Boolean(deepseekHifLeim),
+      lastSnapshot: lastDeepSeekSnapshot
+    },
+    qwen: {
+      pending: Boolean(qwenState),
+      syncInFlight: Boolean(qwenState && qwenState.syncInFlight),
+      accountId: qwenState ? String(qwenState.accountId || "") : "",
+      verificationHost: qwenState ? popupSafeHost(qwenState.verificationUrl) : "",
+      startedAt: qwenState ? Number(qwenState.startedAt || 0) : 0
+    },
+    doubao: {
+      authRequired: Boolean(authRequired),
+      authRequiredSince: Number(authRequiredSince || 0),
+      syncInFlight: Boolean(syncInFlight),
+      lastCapture: (lastCaptured && lastCaptured.conversation) ? {
+        conversation_id: String(lastCaptured.conversation.conversation_id || ""),
+        section_id: String(lastCaptured.conversation.section_id || ""),
+        last_message_index: Number(lastCaptured.conversation.last_message_index || 0),
+        complete: Boolean(lastCaptured.complete),
+        error: lastCaptured.error ? String(lastCaptured.error.message || lastCaptured.error.code || "error") : "",
+        completedAt: Number(lastCaptured.completedAt || 0)
+      } : null
+    },
+    // Secret-free persistent state reported by Voice Edge (may be null until
+    // the async STATE_REPORT arrives). Panel triggers a refresh each poll.
+    persistent: lastStateReport
+  };
+}
+
+async function popupSyncDoubao() {
+  if (typeof synchronizeCapture !== "function") return { ok: false, error: "background 未就绪" };
+  if (!lastCaptured || !lastCaptured.complete || lastCaptured.error) {
+    return { ok: false, error: "请先在豆包网页发送一条消息并等待完整回复" };
+  }
+  try { await synchronizeCapture(lastCaptured, false); return { ok: true }; }
+  catch (error) { try { syncInFlight = false; } catch (_) {} return { ok: false, error: compactError(error) }; }
+}
+
+async function popupOpen(provider) {
+  const url = POPUP_OPEN_URLS[String(provider || "")];
+  if (!url) return { ok: false, error: "未知的 provider" };
+  try { await browser.tabs.create({ url, active: true }); return { ok: true }; }
+  catch (error) { return { ok: false, error: String(error && error.message || error) }; }
+}
+
+browser.runtime.onMessage.addListener(message => {
+  if (!message || typeof message !== "object") return;
+  if (message.type === "DEEPSEEK_CONVERSATION_SNAPSHOT") {
+    // Remember it for the panel; the original relay listener still forwards it.
+    lastDeepSeekSnapshot = {
+      conversation_id: String(message.conversation_id || ""),
+      model_type: String(message.model_type || ""),
+      page_url: String(message.page_url || ""),
+      captured_at: Number(message.captured_at || Date.now())
+    };
+    return;
+  }
+  if (message.type === "POPUP_GET_STATE") {
+    requestBrowserState(false);            // refresh persistent state (async)
+    return Promise.resolve(popupBuildState());
+  }
+  if (message.type === "POPUP_SYNC_DOUBAO") return popupSyncDoubao();
+  if (message.type === "POPUP_RECONNECT") {
+    try { connectNative(); } catch (_) {}
+    requestBrowserState(true);
+    return Promise.resolve({ ok: true, connected: Boolean(nativePort) });
+  }
+  if (message.type === "POPUP_MUTATE") {
+    const port = connectNative();
+    if (!port) return Promise.resolve({ ok: false, error: "无法连接 Native Host" });
+    try {
+      port.postMessage({
+        type: "STATE_MUTATE",
+        action: String(message.action || "clear"),
+        provider: String(message.provider || ""),
+        model_type: String(message.model_type || "")
+      });
+      // The STATE_REPORT reply refreshes lastStateReport via handleNativeMessage;
+      // nudge another read so the panel reflects the change immediately.
+      requestBrowserState(true);
+      return Promise.resolve({ ok: true });
+    } catch (e) {
+      return Promise.resolve({ ok: false, error: String(e && e.message || e) });
+    }
+  }
+  if (message.type === "POPUP_OPEN") return popupOpen(message.provider);
+});
+
+// Warm the persistent-state cache shortly after startup.
+setTimeout(() => requestBrowserState(true), 800);

@@ -1,0 +1,186 @@
+:root {
+  --bg: #14161c;
+  --panel: #1b1e26;
+  --panel-2: #232733;
+  --line: #2c313d;
+  --text: #e7eaf0;
+  --muted: #97a0b0;
+  --accent: #5b8cff;
+  --ok: #3fb950;
+  --warn: #e3b341;
+  --err: #f85149;
+  --deepseek: #4d6bfe;
+  --qwen: #7b5cff;
+  --doubao: #ff6a3d;
+}
+
+* { box-sizing: border-box; }
+
+/* Firefox sizes the popup to <body> and expands the window to accommodate a
+   vertical scrollbar on its own. A fixed body width plus a simple, non-grid
+   layout (matching a known-good reference popup) is what avoids a spurious
+   horizontal scrollbar. Every long value wraps via overflow-wrap below. */
+body {
+  margin: 0;
+  width: 340px;
+  max-width: 340px;
+  font: 13px/1.45 -apple-system, "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  overflow-x: hidden;
+}
+
+.ve-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: linear-gradient(180deg, #1b1f2b, #14161c);
+  border-bottom: 1px solid var(--line);
+}
+.ve-logo { border-radius: 7px; }
+.ve-header { min-width: 0; }
+.ve-title { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+.ve-name, .ve-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-name { font-weight: 700; font-size: 14px; letter-spacing: .2px; }
+.ve-sub { font-size: 11px; color: var(--muted); }
+.ve-icon-btn {
+  margin-left: auto;
+  width: 28px; height: 28px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 15px;
+}
+.ve-icon-btn:hover { border-color: var(--accent); }
+
+.ve-native {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.ve-native { min-width: 0; }
+#native-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.ve-dot.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.ve-dot.err { background: var(--err); box-shadow: 0 0 6px var(--err); }
+.ve-mini-btn {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  font-size: 11px;
+  flex: none;            /* never let the button be squeezed to 2 lines */
+  white-space: nowrap;
+}
+.ve-mini-btn:hover { border-color: var(--accent); }
+.ve-mini-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ve-native .ve-mini-btn { margin-left: auto; }
+
+main { padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+
+.ve-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.ve-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; min-width: 0; }
+.ve-card-head .ve-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-badge {
+  font-weight: 700;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: #fff;
+}
+.ve-badge-deepseek { background: var(--deepseek); }
+.ve-badge-qwen { background: var(--qwen); }
+.ve-badge-doubao { background: var(--doubao); }
+.ve-status { font-size: 11px; color: var(--muted); }
+.ve-status.ok { color: var(--ok); }
+.ve-status.warn { color: var(--warn); }
+.ve-status.err { color: var(--err); }
+.ve-open { margin-left: auto; }
+
+/* Block, not grid: a grid 1fr track sizes to min-content and long ids/cookie
+   names push the whole column wider than the popup, causing a horizontal
+   scrollbar. Plain block rows (each row is its own flex) never do that. */
+.ve-kv { margin: 0; display: block; }
+.ve-kv > div { margin: 3px 0; }
+.ve-kv > div { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.ve-kv > div[hidden] { display: none; }
+.ve-kv dt { color: var(--muted); font-size: 11px; min-width: 96px; flex: none; }
+.ve-kv dd {
+  margin: 0;
+  min-width: 0;
+  flex: 1 1 auto;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.ve-persist {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.ve-persist-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+  min-width: 0;
+}
+.ve-persist-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ve-persist-title {
+  font-size: 10.5px;
+  color: var(--muted);
+  letter-spacing: .2px;
+}
+.ve-persist-head .ve-new { margin-left: auto; }
+
+.ve-primary-btn {
+  margin-top: 10px;
+  width: 100%;
+  border: 0;
+  background: var(--doubao);
+  color: #fff;
+  font-weight: 600;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.ve-primary-btn:hover { filter: brightness(1.08); }
+.ve-primary-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+.ve-hint { margin: 6px 0 0; font-size: 11px; }
+.ve-hint:empty { margin: 0; }
+.ve-hint.ok { color: var(--ok); }
+.ve-hint.err { color: var(--err); }
+
+.ve-footer {
+  padding: 8px 14px 12px;
+  font-size: 10.5px;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+}
+.ve-foot-path {
+  display: block;
+  margin-top: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 9.5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}

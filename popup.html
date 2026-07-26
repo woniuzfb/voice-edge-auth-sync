@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="popup.css">
+  <title>Voice Edge</title>
+</head>
+<body>
+  <header class="ve-header">
+    <img class="ve-logo" src="icons/icon-48.png" alt="Voice Edge" width="28" height="28">
+    <div class="ve-title">
+      <span class="ve-name">Voice Edge</span>
+      <span class="ve-sub">浏览器会话状态</span>
+    </div>
+    <button id="refresh" class="ve-icon-btn" title="刷新">↻</button>
+  </header>
+
+  <section class="ve-native" id="native-card">
+    <span class="ve-dot" id="native-dot"></span>
+    <span id="native-text">正在检查 Native Host…</span>
+    <button id="reconnect" class="ve-mini-btn" title="重连 Native Host">重连</button>
+  </section>
+
+  <main id="providers">
+    <!-- DeepSeek -->
+    <article class="ve-card" data-provider="deepseek">
+      <div class="ve-card-head">
+        <span class="ve-badge ve-badge-deepseek">DeepSeek</span>
+        <span class="ve-status" id="ds-status">—</span>
+        <button class="ve-mini-btn ve-open" data-open="deepseek">打开</button>
+      </div>
+      <dl class="ve-kv">
+        <div><dt>Authorization</dt><dd id="ds-auth">—</dd></div>
+        <div><dt>x-hif-leim</dt><dd id="ds-hif">—</dd></div>
+        <div id="ds-conv-row" hidden><dt>最近转发</dt><dd id="ds-conv">—</dd></div>
+      </dl>
+      <div class="ve-persist">
+        <div class="ve-persist-head">
+          <span class="ve-persist-title">持久化会话 (Voice Edge)</span>
+          <button class="ve-mini-btn ve-new" data-new="deepseek" title="清除所有模式的已存会话，下次请求新开对话">新建对话</button>
+        </div>
+        <dl class="ve-kv">
+          <div id="ds-p-default-row" hidden><dt>快速模式</dt><dd id="ds-p-default">—</dd></div>
+          <div id="ds-p-expert-row" hidden><dt>专家模式</dt><dd id="ds-p-expert">—</dd></div>
+          <div id="ds-p-vision-row" hidden><dt>识图模式</dt><dd id="ds-p-vision">—</dd></div>
+          <div id="ds-p-count-row" hidden><dt>已知会话数</dt><dd id="ds-p-count">—</dd></div>
+          <div id="ds-p-auth-row" hidden><dt>凭证</dt><dd id="ds-p-auth">—</dd></div>
+        </dl>
+      </div>
+    </article>
+
+    <!-- Qwen -->
+    <article class="ve-card" data-provider="qwen">
+      <div class="ve-card-head">
+        <span class="ve-badge ve-badge-qwen">Qwen</span>
+        <span class="ve-status" id="qw-status">—</span>
+        <button class="ve-mini-btn ve-open" data-open="qwen">打开</button>
+      </div>
+      <dl class="ve-kv">
+        <div id="qw-host-row" hidden><dt>验证域名</dt><dd id="qw-host">—</dd></div>
+      </dl>
+      <div class="ve-persist">
+        <div class="ve-persist-head">
+          <span class="ve-persist-title">持久化会话 (Voice Edge)</span>
+          <button class="ve-mini-btn ve-new" data-new="qwen" title="清除已存会话，下次请求新开对话">新建对话</button>
+        </div>
+        <dl class="ve-kv">
+          <div id="qw-p-conv-row" hidden><dt>会话 ID</dt><dd id="qw-p-conv">—</dd></div>
+          <div id="qw-p-acct-row" hidden><dt>account_id</dt><dd id="qw-p-acct">—</dd></div>
+          <div id="qw-p-auth-row" hidden><dt>凭证</dt><dd id="qw-p-auth">—</dd></div>
+        </dl>
+      </div>
+    </article>
+
+    <!-- Doubao -->
+    <article class="ve-card" data-provider="doubao">
+      <div class="ve-card-head">
+        <span class="ve-badge ve-badge-doubao">豆包</span>
+        <span class="ve-status" id="db-status">—</span>
+        <button class="ve-mini-btn ve-open" data-open="doubao">打开</button>
+      </div>
+      <!-- Realtime capture only appears when you use doubao.com in THIS Firefox. -->
+      <div id="db-live-block" hidden>
+        <dl class="ve-kv">
+          <div><dt>最近捕获</dt><dd id="db-conv">—</dd></div>
+          <div><dt>message_index</dt><dd id="db-index">—</dd></div>
+          <div><dt>完整回复</dt><dd id="db-complete">—</dd></div>
+        </dl>
+      </div>
+      <div class="ve-persist">
+        <div class="ve-persist-head">
+          <span class="ve-persist-title">持久化会话 (Voice Edge)</span>
+          <button class="ve-mini-btn ve-new" data-new="doubao" title="清除已存会话，下次请求新开对话">新建对话</button>
+        </div>
+        <dl class="ve-kv">
+          <div id="db-p-conv-row" hidden><dt>会话 ID</dt><dd id="db-p-conv">—</dd></div>
+          <div id="db-p-auth-row" hidden><dt>凭证</dt><dd id="db-p-auth">—</dd></div>
+        </dl>
+      </div>
+      <button id="sync-doubao" class="ve-primary-btn" hidden>立即同步豆包状态</button>
+      <p class="ve-hint" id="db-hint"></p>
+    </article>
+  </main>
+
+  <footer class="ve-footer">
+    <span id="foot-note">「新建对话」仅清除已存会话 ID（下次请求新开对话）；不影响登录，不删除服务器会话。</span>
+    <span id="foot-path" class="ve-foot-path"></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
