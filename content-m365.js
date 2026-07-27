@@ -18,12 +18,14 @@
 
   function PAGE_HOOK() {
     "use strict";
-    if (window.__veM365Self) {
+    const priorHook = window.__veM365Hook;
+    if (priorHook && priorHook.ready === true) {
       window.postMessage(
         {
           __veM365: true,
           dir: "fromPage",
           type: "M365_FRAME_READY",
+          capabilities: priorHook.capabilities,
           frameOrigin: location.origin,
           frameUrl: location.href,
         },
@@ -31,7 +33,12 @@
       );
       return;
     }
-    window.__veM365Self = true;
+    // Do not advertise readiness until every handler below has been installed.
+    const hookState = {
+      ready: false,
+      capabilities: null,
+    };
+    window.__veM365Hook = hookState;
 
     const RS = "\u001e";
     // 固定 feature-flag 串(照抄实测抓包;服务端如要求更新再改)
@@ -287,58 +294,132 @@
           String(d.text || ""),
           String(d.tone || "Claude_Opus"),
           String(d.conversationId || ""),
+          Array.isArray(d.attachments) ? d.attachments : [],
         );
       }
     });
 
     // ---- 自建 Chathub WSS,发一轮,读流 ----
-    function buildChatArgs(text, tone, conversationId) {
+    function buildChatArgs(text, tone, conversationId, attachments = []) {
       const rid = uuid();
+      const messageAnnotations = attachments
+        .filter(
+          (file) =>
+            file &&
+            file.name &&
+            file.url &&
+            file.verified === true &&
+            file.itemId &&
+            file.driveId,
+        )
+        .map((file) => ({
+          id: String(file.url),
+          text: String(file.name),
+          url: String(file.url),
+          messageAnnotationType: "FileUrl",
+        }));
+      const hasAttachments = messageAnnotations.length > 0;
+      const capturedAttachmentOptionsSets = [
+        "search_result_progress_messages_with_search_queries",
+        "update_textdoc_response_after_streaming",
+        "deepleo_networking_timeout_10minutes_canmore",
+        "cwc_flux_image",
+        "cwc_code_interpreter",
+        "cwc_code_interpreter_amsfix",
+        "cwcfluxgptv",
+        "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+        "gptvnorm2048",
+        "cwc_code_interpreter_citation_fix",
+        "code_interpreter_interactive_charts",
+        "cwc_code_interpreter_interactive_charts_inline_image",
+        "code_interpreter_matplotlib_patching",
+        "cwc_fileupload_odb",
+        "update_memory_plugin",
+        "add_custom_instructions",
+        "cwc_flux_v3",
+        "flux_v3_progress_messages",
+        "enable_batch_token_processing",
+        "enable_gg_gpt",
+        "flux_v3_references",
+        "flux_v3_references_entities",
+        "flux_v3_image_gen_enable_dimensions",
+        "flux_v3_image_gen_enable_non_watermarked_storage",
+        "flux_v3_image_gen_enable_icon_dimensions",
+        "flux_v3_image_gen_enable_system_text_with_params",
+        "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+        "flux_v3_image_gen_enable_story",
+        "rich_responses",
+      ];
+      const officeClientInfo = {
+        clientPlatform: "mcmcopilot-web",
+        clientAppName: "Office",
+        clientEntrypoint: "mcmcopilot-officeweb",
+        clientSessionId: uuid(),
+        ProductCategory: "Chat",
+        clientAppType: "Web",
+        productEntryPoint: "ChatPanel",
+        deviceOS: "macOS",
+        deviceType: "Desktop",
+        clientPlatformVersion: "10.15",
+      };
+      const owaClientInfo = {
+        clientPlatform: "OwaHub-web",
+        clientAppName: "OwaHub",
+        clientEntrypoint: "owahub",
+        clientSessionId: uuid(),
+        clientAppType: "Web",
+        deviceOS: "macOS",
+        deviceType: "Desktop",
+        clientPlatformVersion: "10.15",
+      };
       return {
         args: {
-          source: "owahub",
+          source: hasAttachments ? "officeweb" : "owahub",
           clientCorrelationId: rid,
           sessionId: uuid(),
-          optionsSets: [
-            "enterprise_flux_web",
-            "enterprise_flux_work",
-            "enable_request_response_interstitials",
-            "enterprise_flux_image_v1",
-            "enterprise_toolbox_with_skdsstore_search_message_extensions",
-            "enable_ME_auth_interstitial",
-            "enable_confirmation_interstitial",
-            "enable_plugin_auth_interstitial",
-            "enable_response_action_processing",
-            "enterprise_pagination_support",
-            "search_result_progress_messages_with_search_queries",
-            "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
-            "rich_responses",
-            "gptvnorm2048",
-            "enterprise_flux_work_code_interpreter",
-            "cwc_code_interpreter_citation_fix",
-            "code_interpreter_interactive_charts",
-            "enterprise_code_interpreter_citation_fix",
-            "cwc_code_interpreter_interactive_charts_inline_image",
-            "code_interpreter_matplotlib_patching",
-            "enable_batch_token_processing",
-            "disable_cea_message_listener",
-            "enable_selective_url_redaction",
-            "update_memory_plugin",
-            "add_custom_instructions",
-            "agent_recommendations",
-            "enable_gg_gpt",
-            "enable_inferred_memory_read",
-            "update_textdoc_response_after_streaming",
-            "deepleo_networking_timeout_10minutes_canmore",
-            "flux_v3_references",
-            "flux_v3_references_entities",
-            "flux_v3_image_gen_enable_dimensions",
-            "flux_v3_image_gen_enable_non_watermarked_storage",
-            "flux_v3_image_gen_enable_icon_dimensions",
-            "flux_v3_image_gen_enable_system_text_with_params",
-            "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
-            "flux_v3_image_gen_enable_story",
-          ],
+          optionsSets: hasAttachments
+            ? capturedAttachmentOptionsSets
+            : [
+                "enterprise_flux_web",
+                "enterprise_flux_work",
+                "enable_request_response_interstitials",
+                "enterprise_flux_image_v1",
+                "enterprise_toolbox_with_skdsstore_search_message_extensions",
+                "enable_ME_auth_interstitial",
+                "enable_confirmation_interstitial",
+                "enable_plugin_auth_interstitial",
+                "enable_response_action_processing",
+                "enterprise_pagination_support",
+                "search_result_progress_messages_with_search_queries",
+                "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+                "rich_responses",
+                "gptvnorm2048",
+                "enterprise_flux_work_code_interpreter",
+                "cwc_code_interpreter_citation_fix",
+                "code_interpreter_interactive_charts",
+                "enterprise_code_interpreter_citation_fix",
+                "cwc_code_interpreter_interactive_charts_inline_image",
+                "code_interpreter_matplotlib_patching",
+                "enable_batch_token_processing",
+                "disable_cea_message_listener",
+                "enable_selective_url_redaction",
+                "update_memory_plugin",
+                "add_custom_instructions",
+                "agent_recommendations",
+                "enable_gg_gpt",
+                "enable_inferred_memory_read",
+                "update_textdoc_response_after_streaming",
+                "deepleo_networking_timeout_10minutes_canmore",
+                "flux_v3_references",
+                "flux_v3_references_entities",
+                "flux_v3_image_gen_enable_dimensions",
+                "flux_v3_image_gen_enable_non_watermarked_storage",
+                "flux_v3_image_gen_enable_icon_dimensions",
+                "flux_v3_image_gen_enable_system_text_with_params",
+                "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+                "flux_v3_image_gen_enable_story",
+                ...(messageAnnotations.length ? ["cwc_fileupload_odb"] : []),
+              ],
           streamingMode: "ConciseWithPadding",
           options: {},
           extraExtensionParameters: {},
@@ -370,25 +451,18 @@
             "EscapeHatch",
             "TriggerPluginAuth",
             "ResumePluginAuth",
+            ...(hasAttachments ? ["SideBySide"] : []),
             "ReferencesListComplete",
-            "CompleteExtension",
-            "TriggerExtension",
+            ...(hasAttachments
+              ? []
+              : ["CompleteExtension", "TriggerExtension"]),
             "SwitchRespondingEndpoint",
           ],
           sliceIds: [],
           threadLevelGptId: {},
           traceId: rid,
           isStartOfSession: false,
-          clientInfo: {
-            clientPlatform: "OwaHub-web",
-            clientAppName: "OwaHub",
-            clientEntrypoint: "owahub",
-            clientSessionId: uuid(),
-            clientAppType: "Web",
-            deviceOS: "macOS",
-            deviceType: "Desktop",
-            clientPlatformVersion: "10.15",
-          },
+          clientInfo: hasAttachments ? officeClientInfo : owaClientInfo,
           message: {
             author: "user",
             inputMethod: "Keyboard",
@@ -405,19 +479,36 @@
             messageType: "Chat",
             experienceType: "Default",
             adaptiveCards: [],
-            clientPreferences: { executionControls: { web: {}, work: {} } },
+            messageAnnotations,
+            clientPreferences: hasAttachments
+              ? {}
+              : { executionControls: { web: {}, work: {} } },
+            ...(hasAttachments
+              ? {
+                  connectedFederatedConnections: ["dummyId"],
+                  clientInfo: officeClientInfo,
+                }
+              : {}),
           },
-          gpts: [
-            {
-              id: "bizchat-as-gpt-scenario",
-              source: "BuiltInAgents",
-              clientOverrides: {
-                capabilities: [{ name: "WebSearch" }, { name: "WorkSearch" }],
-                "deepResearchModels@odata.type": "Collection(String)",
-              },
-            },
-          ],
+          ...(hasAttachments
+            ? {}
+            : {
+                gpts: [
+                  {
+                    id: "bizchat-as-gpt-scenario",
+                    source: "BuiltInAgents",
+                    clientOverrides: {
+                      capabilities: [
+                        { name: "WebSearch" },
+                        { name: "WorkSearch" },
+                      ],
+                      "deepResearchModels@odata.type": "Collection(String)",
+                    },
+                  },
+                ],
+              }),
           plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
+          ...(hasAttachments ? { isSbsSupported: true } : {}),
           tone: tone || "Claude_Opus",
           renderReferencesBehindEOS: true,
           disconnectBehavior: "continue",
@@ -426,7 +517,7 @@
       };
     }
 
-    async function doAsk(id, text, tone, conversationId) {
+    async function doAsk(id, text, tone, conversationId, attachments = []) {
       let ws = null;
       try {
         const token = await requestSydneyToken();
@@ -440,6 +531,13 @@
 
         const sid = uuid(),
           reqSess = uuid();
+        const hasAttachments =
+          Array.isArray(attachments) && attachments.length > 0;
+        const transportProfile = hasAttachments
+          ? "&source=%22officeweb%22&product=Office&agentHost=Bizchat.ChatPanel" +
+            "&licenseType=Starter&isEdu=true&agent=work&scenario=officeweb"
+          : "&source=%22owahub%22&product=OwaHub&agentHost=Bizchat.FullScreen" +
+            "&licenseType=Starter&isEdu=true&agent=work&scenario=owahub";
         const url =
           "wss://substrate.office.com/m365Copilot/Chathub/" +
           encodeURIComponent(oid) +
@@ -459,11 +557,10 @@
           encodeURIComponent(token) +
           "&variants=" +
           VARIANTS +
-          "&source=%22owahub%22&product=OwaHub&agentHost=Bizchat.FullScreen" +
-          "&licenseType=Starter&isEdu=true&agent=work&scenario=owahub";
+          transportProfile;
 
         ws = new WebSocket(url); // browser supplies this frame's Origin
-        const { args } = buildChatArgs(text, tone, convId);
+        const { args } = buildChatArgs(text, tone, convId, attachments);
         const invId = "0"; // 全新 socket,首个调用用 "0"(每 socket 只发一轮)
         let best = "";
         let cursorText = "";
@@ -606,8 +703,30 @@
       }
     }
 
+    hookState.capabilities = {
+      messageListener: true,
+      tokenBridge: true,
+      chatBuilder: typeof buildChatArgs === "function",
+      doAsk: typeof doAsk === "function",
+      websocket: typeof WebSocket === "function",
+      attachments: true,
+    };
+    hookState.ready =
+      hookState.capabilities.messageListener &&
+      hookState.capabilities.chatBuilder &&
+      hookState.capabilities.doAsk &&
+      hookState.capabilities.websocket;
+    if (!hookState.ready) {
+      delete window.__veM365Hook;
+      post({
+        type: "M365_HOOK_ERROR",
+        error: "M365 page hook initialization incomplete",
+      });
+      return;
+    }
     post({
       type: "M365_FRAME_READY",
+      capabilities: hookState.capabilities,
       frameOrigin: location.origin,
       frameUrl: location.href,
     });
@@ -623,10 +742,19 @@
   });
   browser.runtime.onMessage.addListener((msg) => {
     if (!msg || !msg.__veM365ToPage) return;
+    const payload = msg.payload || {};
     window.postMessage(
-      Object.assign({ __veM365: true, dir: "toPage" }, msg.payload),
+      Object.assign({ __veM365: true, dir: "toPage" }, payload),
       "*",
     );
+    return Promise.resolve({
+      ok: true,
+      relayed: true,
+      frameUrl: location.href,
+      attachmentCount: Array.isArray(payload.attachments)
+        ? payload.attachments.length
+        : -1,
+    });
   });
 
   // Inject page world only after the relays exist.

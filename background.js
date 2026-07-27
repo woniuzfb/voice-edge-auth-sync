@@ -914,6 +914,13 @@ function popupBuildState() {
             }
           : null,
     },
+    sharepoint: {
+      configured: Boolean(sharePointHomeUrl),
+      homeUrl: sharePointHomeUrl,
+      uploadFolder: sharePointUploadFolder,
+      readyPageUrl: sharePointReadyPageUrl,
+      lastResult: sharePointLastResult,
+    },
     m365: {
       bridgeConnected: Boolean(m365Ws && m365Ws.readyState === WebSocket.OPEN),
       authLoaded: Boolean(m365AuthLoaded),
@@ -1016,9 +1023,91 @@ browser.runtime.onMessage.addListener((message) => {
       });
     }
   }
+  if (message.type === "POPUP_SP_TEST") return runSharePointCommand("SP_TEST");
+  if (message.type === "POPUP_SP_UPLOAD_TEST")
+    return runSharePointCommand("SP_UPLOAD_TEST");
   if (message.type === "POPUP_OPEN") return popupOpen(message.provider);
 });
 
+async function ensureSharePointTab() {
+  if (!sharePointHomeUrl) throw new Error("SHAREPOINT_HOME_URL 未配置");
+  const home = new URL(sharePointHomeUrl);
+  const sitePrefix = home.origin + home.pathname.replace(/\/$/, "");
+  const allItemsUrl = sitePrefix + "/Shared%20Documents/Forms/AllItems.aspx";
+  const tabs = await browser.tabs.query({ url: [sitePrefix + "/*"] });
+  const usable = tabs.find((tab) => tab.id != null && !tab.discarded);
+  if (usable) return usable;
+  return browser.tabs.create({ url: allItemsUrl, active: false });
+}
+
+async function sendSharePointCommand(tab, payload) {
+  const deadline = Date.now() + 20000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await browser.tabs.sendMessage(tab.id, payload);
+      if (response) return response;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  throw new Error(
+    "SharePoint 页面监听器未就绪。请确认已登录站点并刷新页面" +
+      (lastError && lastError.message ? "：" + lastError.message : ""),
+  );
+}
+
+async function runSharePointCommand(type) {
+  try {
+    const tab = await ensureSharePointTab();
+    const payload = {
+      __veSharePoint: true,
+      type,
+      siteUrl: sharePointHomeUrl,
+      uploadFolder: sharePointUploadFolder,
+    };
+    const response = await sendSharePointCommand(tab, payload);
+    sharePointLastResult = {
+      ...response,
+      type,
+      at: Date.now(),
+      error: response.ok
+        ? ""
+        : String(response.error || "SharePoint test failed"),
+    };
+    return sharePointLastResult;
+  } catch (error) {
+    sharePointLastResult = {
+      ok: false,
+      type,
+      at: Date.now(),
+      error: compactError(error),
+    };
+    return sharePointLastResult;
+  }
+}
+
+browser.runtime.onMessage.addListener((message) => {
+  if (!message || message.__veSharePoint !== true) return;
+  if (message.type === "SP_FRAME_READY") {
+    sharePointReadyPageUrl = String(message.pageUrl || "");
+    return;
+  }
+  if (message.type === "SP_UPLOAD_COMPLETE") {
+    const requestId = String(message.requestId || "");
+    const waiter = sharePointUploadWaiters.get(requestId);
+    if (waiter) {
+      sharePointUploadWaiters.delete(requestId);
+      waiter.resolve(
+        message.response || {
+          ok: false,
+          error: "empty SharePoint upload response",
+        },
+      );
+    }
+  }
+});
 // Warm the persistent-state cache shortly after startup.
 setTimeout(() => requestBrowserState(true), 800);
 
@@ -1038,6 +1127,8 @@ let _clientId = "";
 let _tid = "";
 let _m365TokenContext = { version: 1, query: {}, body: {} };
 let _sydney = { token: "", exp: 0 };
+let _sharePoint = { token: "", exp: 0, origin: "" };
+let _sharePointRefreshing = null;
 let m365LastRefreshError = "";
 let m365LastRefreshErrorAt = 0;
 let _refreshing = null;
@@ -1048,6 +1139,11 @@ let m365LatestTokenResponseAt = 0;
 let m365SettingsLoaded = false;
 let m365SettingsLoadPromise = null;
 let m365EntryUrl = "";
+let sharePointHomeUrl = "";
+let sharePointUploadFolder = "";
+let sharePointLastResult = null;
+let sharePointReadyPageUrl = "";
+const sharePointUploadWaiters = new Map();
 let m365Ws = null;
 let m365ReconnectTimer = null;
 let m365ReconnectAttempt = 0;
@@ -1056,6 +1152,9 @@ const M365_RECONNECT_MAX_MS = 30000;
 let m365TargetFrame = null;
 const m365FrameCandidates = new Map();
 const log = (...args) => console.log("[VE-m365-bg]", ...args);
+browser.runtime.onMessage.addListener((message, sender) => {
+  if (!message || message.__veSharePoint !== true) return;
+});
 
 function normalizeM365EntryUrl(value) {
   const text = String(value || "").trim();
@@ -1118,6 +1217,8 @@ async function clearM365Auth() {
   _tid = "";
   _m365TokenContext = { version: 1, query: {}, body: {} };
   _sydney = { token: "", exp: 0 };
+  _sharePoint = { token: "", exp: 0, origin: "" };
+  _sharePointRefreshing = null;
   m365LastRefreshError = "";
   m365LastRefreshErrorAt = 0;
   m365AuthUpdatedAt = 0;
@@ -1415,6 +1516,109 @@ async function refreshSydney() {
   }
 }
 
+async function refreshSharePointAccessToken(siteUrl) {
+  await ensureM365AuthLoaded();
+  const origin = new URL(String(siteUrl || "")).origin;
+  if (!origin.endsWith(".sharepoint.com"))
+    throw new Error("invalid SharePoint token origin");
+  if (
+    _sharePoint.token &&
+    _sharePoint.origin === origin &&
+    _sharePoint.exp - Date.now() > 90000
+  ) {
+    // Keep the return contract identical for both fresh and cached tokens.
+    // content-sharepoint.js expects the complete Authorization header value.
+    return "Bearer " + _sharePoint.token;
+  }
+  if (_sharePointRefreshing) return _sharePointRefreshing;
+  if (!_clientId || !_rt || !_tid)
+    throw new Error(
+      "SharePoint bearer unavailable: M365 refresh credentials not captured",
+    );
+  _sharePointRefreshing = (async () => {
+    const capturedQuery = _m365TokenContext.query || {};
+    const capturedBody = _m365TokenContext.body || {};
+    const endpoint = new URL(
+      "https://login.microsoftonline.com/" + _tid + "/oauth2/v2.0/token",
+    );
+    // Match the successful Outlook/MSAL refresh request. The previous build
+    // sent a minimal form, which dropped broker/redirect/claims context and
+    // caused AADSTS70000 even though the refresh token itself was current.
+    for (const [name, value] of Object.entries(capturedQuery)) {
+      if (value != null && value !== "")
+        endpoint.searchParams.set(name, String(value));
+    }
+    endpoint.searchParams.set("client_id", _clientId);
+    endpoint.searchParams.set("client-request-id", crypto.randomUUID());
+    const body = new URLSearchParams();
+    for (const [name, value] of Object.entries(capturedBody)) {
+      if (value != null) body.set(name, String(value));
+    }
+    body.set("client_id", _clientId);
+    body.set("grant_type", "refresh_token");
+    body.set("refresh_token", _rt);
+    body.set("scope", origin + "/.default openid profile offline_access");
+    const response = await fetch(endpoint.href, {
+      method: "POST",
+      headers: {
+        Accept: "*/*",
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+      },
+      body: body.toString(),
+    });
+    const text = await response.text();
+    let payload = {};
+    try {
+      payload = text ? JSON.parse(text) : {};
+    } catch (_) {
+      payload = { raw: text };
+    }
+    if (!response.ok || !payload.access_token) {
+      const detail = String(
+        payload.error_description ||
+          payload.error ||
+          payload.raw ||
+          response.status,
+      )
+        .replace(/\s+/g, " ")
+        .slice(0, 500);
+      throw new Error(
+        "SharePoint token refresh failed (" + response.status + "): " + detail,
+      );
+    }
+    const claims = decodeM365Jwt(payload.access_token);
+    const host = new URL(origin).hostname.toLowerCase();
+    const audience = String(claims.aud || "").toLowerCase();
+    if (
+      !audience.includes(host) &&
+      !audience.includes("00000003-0000-0ff1-ce00-000000000000")
+    )
+      throw new Error(
+        "unexpected SharePoint token audience: " + (claims.aud || "missing"),
+      );
+    if (claims.tid && String(claims.tid).toLowerCase() !== _tid.toLowerCase())
+      throw new Error("SharePoint token tenant mismatch");
+    if (payload.refresh_token) {
+      _rt = payload.refresh_token;
+      await saveM365Auth();
+    }
+    const jwtExp = Number(claims.exp || 0) * 1000;
+    _sharePoint = {
+      token: payload.access_token,
+      exp:
+        jwtExp ||
+        Date.now() +
+          Math.max(0, Number(payload.expires_in || 3600) - 60) * 1000,
+      origin,
+    };
+    return "Bearer " + _sharePoint.token;
+  })();
+  try {
+    return await _sharePointRefreshing;
+  } finally {
+    _sharePointRefreshing = null;
+  }
+}
 setInterval(
   () => {
     if (m365AuthLoaded && _clientId && _rt && _tid)
@@ -1475,6 +1679,13 @@ function m365Connect() {
       setM365EntryUrl(message.entryUrl).catch((error) =>
         log("invalid M365 config:", compactError(error)),
       );
+      sharePointHomeUrl = String(message.sharePointHomeUrl || "").replace(
+        /\/$/,
+        "",
+      );
+      sharePointUploadFolder = String(
+        message.sharePointUploadFolder || "",
+      ).replace(/^\/+|\/+$/g, "");
       return;
     }
     if (message.type === "M365_ASK") {
@@ -1554,14 +1765,76 @@ async function waitForM365Hook(tabId, timeoutMs = 15000) {
   );
 }
 
+async function prepareM365Attachments(message) {
+  const raw = Array.isArray(message.attachments) ? message.attachments : [];
+  if (!raw.length) return [];
+  if (!sharePointHomeUrl)
+    throw new Error("SHAREPOINT_HOME_URL 未配置，无法上传 M365 附件");
+  const sharePointAccessToken =
+    await refreshSharePointAccessToken(sharePointHomeUrl);
+  const tab = await ensureSharePointTab();
+  const uploadRequestId =
+    String(message.id || "") + ":" + Date.now() + ":" + crypto.randomUUID();
+  const completion = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      sharePointUploadWaiters.delete(uploadRequestId);
+      reject(new Error("SharePoint upload completion event timed out"));
+    }, 60000);
+    sharePointUploadWaiters.set(uploadRequestId, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+    });
+  });
+  // Do not await the tabs.sendMessage response here. The SharePoint listener
+  // used to await runtime.sendMessage(SP_UPLOAD_COMPLETE) while this function
+  // awaited the listener response, creating a cross-context response cycle.
+  // Dispatch once and use only the correlated completion event as the result.
+  browser.tabs
+    .sendMessage(tab.id, {
+      __veSharePoint: true,
+      type: "SP_UPLOAD_FILES",
+      requestId: uploadRequestId,
+      siteUrl: sharePointHomeUrl,
+      uploadFolder: sharePointUploadFolder,
+      files: raw,
+      sharePointAccessToken,
+    })
+    .then((ack) => {})
+    .catch((error) => {
+      const waiter = sharePointUploadWaiters.get(uploadRequestId);
+      if (waiter) {
+        sharePointUploadWaiters.delete(uploadRequestId);
+        waiter.resolve({ ok: false, error: compactError(error) });
+      }
+    });
+  const response = await completion;
+  sharePointUploadWaiters.delete(uploadRequestId);
+  if (!response || !response.ok) {
+    throw new Error(
+      String(
+        (response && response.error) || "SharePoint attachment upload failed",
+      ),
+    );
+  }
+  const uploaded = Array.isArray(response.files) ? response.files : [];
+  return uploaded;
+}
+
 async function dispatchM365(message) {
   try {
+    const attachments = await prepareM365Attachments(message);
+    const outbound = { ...message, attachments };
     const tab = await ensureM365Tab();
+    const candidates = Array.from(m365FrameCandidates.values()).filter(
+      (frame) => frame.tabId === tab.id,
+    );
     const target =
       bestM365FrameForTab(tab.id) || (await waitForM365Hook(tab.id));
-    await browser.tabs.sendMessage(
+    const ack = await browser.tabs.sendMessage(
       tab.id,
-      { __veM365ToPage: true, payload: message },
+      { __veM365ToPage: true, payload: outbound },
       { frameId: target.frameId },
     );
   } catch (error) {
@@ -1582,62 +1855,80 @@ function sendToM365Frame(sender, payload) {
     .catch(() => {});
 }
 
-browser.runtime.onMessage.addListener(async (message, sender) => {
+browser.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.__veM365 !== true) return;
-  if (message.type === "M365_FRAME_READY") {
-    const frame = rememberM365Frame(message, sender, false);
-    if (frame) {
+  return (async () => {
+    if (message.type === "M365_FRAME_READY") {
+      const caps = message.capabilities || {};
+      if (
+        caps.messageListener !== true ||
+        caps.chatBuilder !== true ||
+        caps.doAsk !== true ||
+        caps.websocket !== true
+      ) {
+        log("ignored incomplete M365 page hook", {
+          capabilities: caps,
+        });
+        return;
+      }
+      const frame = rememberM365Frame(message, sender, false);
+      if (frame) {
+        sendM365({
+          type: "M365_READY",
+          frameOrigin: frame.frameOrigin,
+          frameUrl: frame.frameUrl,
+        });
+      }
+      return;
+    }
+    if (message.type === "M365_ENTRY_DISCOVERED") {
+      await setM365EntryUrl(message.entryUrl);
+      return;
+    }
+    if (message.type === "M365_TOKEN_RESPONSE") {
+      try {
+        await applyM365TokenResponse(message);
+      } catch (error) {
+        log("failed to apply M365 token response:", compactError(error));
+      }
+      return;
+    }
+    if (message.type === "M365_NEED_TOKEN") {
+      try {
+        const token = await refreshSydney();
+        sendToM365Frame(sender, {
+          type: "M365_TOKEN",
+          token,
+          exp: _sydney.exp,
+        });
+      } catch (error) {
+        sendToM365Frame(sender, {
+          type: "M365_TOKEN",
+          token: "",
+          error: compactError(error),
+        });
+      }
+      return;
+    }
+    if (message.type === "M365_CHATS_SNAPSHOT") {
+      rememberM365Frame(message, sender, true);
+    }
+    if (
+      ["M365_DELTA", "M365_DONE", "M365_ERROR", "M365_CHATS_SNAPSHOT"].includes(
+        message.type,
+      )
+    ) {
       sendM365({
-        type: "M365_READY",
-        frameOrigin: frame.frameOrigin,
-        frameUrl: frame.frameUrl,
+        type: message.type,
+        id: message.id,
+        text: message.text,
+        conversationId: message.conversationId,
+        chats: message.chats,
+        capturedAt: message.capturedAt,
+        error: message.error,
       });
     }
-    return;
-  }
-  if (message.type === "M365_ENTRY_DISCOVERED") {
-    await setM365EntryUrl(message.entryUrl);
-    return;
-  }
-  if (message.type === "M365_TOKEN_RESPONSE") {
-    try {
-      await applyM365TokenResponse(message);
-    } catch (error) {
-      log("failed to apply M365 token response:", compactError(error));
-    }
-    return;
-  }
-  if (message.type === "M365_NEED_TOKEN") {
-    try {
-      const token = await refreshSydney();
-      sendToM365Frame(sender, { type: "M365_TOKEN", token, exp: _sydney.exp });
-    } catch (error) {
-      sendToM365Frame(sender, {
-        type: "M365_TOKEN",
-        token: "",
-        error: compactError(error),
-      });
-    }
-    return;
-  }
-  if (message.type === "M365_CHATS_SNAPSHOT") {
-    rememberM365Frame(message, sender, true);
-  }
-  if (
-    ["M365_DELTA", "M365_DONE", "M365_ERROR", "M365_CHATS_SNAPSHOT"].includes(
-      message.type,
-    )
-  ) {
-    sendM365({
-      type: message.type,
-      id: message.id,
-      text: message.text,
-      conversationId: message.conversationId,
-      chats: message.chats,
-      capturedAt: message.capturedAt,
-      error: message.error,
-    });
-  }
+  })();
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {

@@ -169,6 +169,16 @@ function render(state) {
   setRow("db-p-auth-row", "db-p-auth", p ? authText(dbp.auth) : "");
   setNewButton("doubao", Boolean(dbp.conversation_id));
 
+  // ---------------- SharePoint Online ----------------
+  const sp = state.sharepoint || {};
+  const spr = sp.lastResult || null;
+  setStatus($("sp-status"), !sp.configured ? "未配置" : spr && spr.ok ? "已连接" : sp.readyPageUrl ? "页面已就绪" : "等待页面", !sp.configured ? "err" : spr && spr.ok ? "ok" : "warn");
+  setRow("sp-home-row", "sp-home", sp.homeUrl || "");
+  setRow("sp-folder-row", "sp-folder", sp.uploadFolder || "");
+  setRow("sp-result-row", "sp-result", spr ? (spr.error || spr.serverRelativeUrl || spr.title || "成功") : "");
+  $("sp-test").disabled = !sp.configured;
+  $("sp-upload-test").disabled = !sp.configured;
+
   // ---------------- M365 Copilot ----------------
   const m365 = state.m365 || {};
   const m365p = pp.m365 || {};
@@ -301,6 +311,20 @@ async function clearM365Auth() {
   }, 900);
 }
 
+async function sharePointAction(type) {
+  const hint = $("sp-hint");
+  hint.textContent = "处理中…";
+  try {
+    const result = await browser.runtime.sendMessage({ type });
+    hint.textContent = result && result.ok ? (result.serverRelativeUrl || result.title || "成功") : ((result && result.error) || "失败");
+    hint.className = "ve-hint " + (result && result.ok ? "ok" : "err");
+  } catch (error) {
+    hint.textContent = String((error && error.message) || error);
+    hint.className = "ve-hint err";
+  }
+  setTimeout(refresh, 300);
+}
+
 async function reconnect() {
   try {
     await browser.runtime.sendMessage({ type: "POPUP_RECONNECT" });
@@ -322,6 +346,8 @@ document.addEventListener("DOMContentLoaded", () => {
   $("reconnect").addEventListener("click", reconnect);
   $("sync-doubao").addEventListener("click", syncDoubao);
   $("m365-clear-auth").addEventListener("click", clearM365Auth);
+  $("sp-test").addEventListener("click", () => sharePointAction("POPUP_SP_TEST"));
+  $("sp-upload-test").addEventListener("click", () => sharePointAction("POPUP_SP_UPLOAD_TEST"));
   for (const b of document.querySelectorAll(".ve-open")) {
     b.addEventListener("click", () =>
       openProvider(b.getAttribute("data-open")),

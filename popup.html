@@ -181,6 +181,22 @@
         <p class="ve-hint" id="db-hint"></p>
       </article>
 
+      <!-- SharePoint Online -->
+      <article class="ve-card" data-provider="sharepoint">
+        <div class="ve-card-head">
+          <span class="ve-badge ve-badge-sharepoint">SharePoint</span>
+          <span class="ve-status" id="sp-status">—</span>
+        </div>
+        <dl class="ve-kv">
+          <div id="sp-home-row" hidden><dt>首页</dt><dd id="sp-home">—</dd></div>
+          <div id="sp-folder-row" hidden><dt>上传目录</dt><dd id="sp-folder">—</dd></div>
+          <div id="sp-result-row" hidden><dt>最近结果</dt><dd id="sp-result">—</dd></div>
+        </dl>
+        <button id="sp-test" class="ve-secondary-btn">测试 SharePoint 会话</button>
+        <button id="sp-upload-test" class="ve-secondary-btn">上传测试文本</button>
+        <p class="ve-hint" id="sp-hint"></p>
+      </article>
+
       <!-- M365 Copilot -->
       <article class="ve-card" data-provider="m365">
         <div class="ve-card-head">
