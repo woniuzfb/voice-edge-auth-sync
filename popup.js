@@ -3,7 +3,8 @@
 const OPEN_URLS = {
   deepseek: "https://chat.deepseek.com/",
   qwen: "https://chat.qwen.ai/",
-  doubao: "https://www.doubao.com/chat/"
+  doubao: "https://www.doubao.com/chat/",
+  m365: "https://m365.cloud.microsoft/",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -77,32 +78,45 @@ function render(state) {
   $("native-text").textContent = connected
     ? `Native Host 已连接 · ${state.native.host}`
     : "Native Host 未连接（无法读取持久化状态）";
-  $("foot-path").textContent = p && p.state_path
-    ? `状态文件：${p.state_path}` +
-      (p.updated_at ? ` · 更新于 ${agoText(p.updated_at * 1000)}` : "")
-    : "";
+  $("foot-path").textContent =
+    p && p.state_path
+      ? `状态文件：${p.state_path}` +
+        (p.updated_at ? ` · 更新于 ${agoText(p.updated_at * 1000)}` : "")
+      : "";
 
   // ---------------- DeepSeek ----------------
   const ds = state.deepseek || {};
   setStatus(
     $("ds-status"),
-    ds.pending ? "等待登录/同步" : ds.authorizationCaptured ? "凭证已捕获" : "空闲",
-    ds.pending ? "warn" : ds.authorizationCaptured ? "ok" : ""
+    ds.pending
+      ? "等待登录/同步"
+      : ds.authorizationCaptured
+        ? "凭证已捕获"
+        : "空闲",
+    ds.pending ? "warn" : ds.authorizationCaptured ? "ok" : "",
   );
-  $("ds-auth").textContent = ds.authorizationCaptured ? "已捕获 (Bearer)" : "未捕获";
+  $("ds-auth").textContent = ds.authorizationCaptured
+    ? "已捕获 (Bearer)"
+    : "未捕获";
   $("ds-hif").textContent = ds.hifCaptured ? "已捕获" : "未捕获";
   const dss = ds.lastSnapshot;
   setRow(
     "ds-conv-row",
     "ds-conv",
-    dss ? `${shortId(dss.conversation_id)}｜${dss.model_type || "?"}｜${agoText(dss.captured_at)}` : ""
+    dss
+      ? `${shortId(dss.conversation_id)}｜${dss.model_type || "?"}｜${agoText(dss.captured_at)}`
+      : "",
   );
   const dsp = pp.deepseek || {};
   const sbm = dsp.sessions_by_mode || {};
   setRow("ds-p-default-row", "ds-p-default", shortId(sbm.default));
   setRow("ds-p-expert-row", "ds-p-expert", shortId(sbm.expert));
   setRow("ds-p-vision-row", "ds-p-vision", shortId(sbm.vision));
-  setRow("ds-p-count-row", "ds-p-count", p ? String(dsp.known_conversation_count || 0) : "");
+  setRow(
+    "ds-p-count-row",
+    "ds-p-count",
+    p ? String(dsp.known_conversation_count || 0) : "",
+  );
   setRow("ds-p-auth-row", "ds-p-auth", p ? authText(dsp.auth) : "");
   setNewButton("deepseek", Boolean(sbm.default || sbm.expert || sbm.vision));
 
@@ -111,12 +125,16 @@ function render(state) {
   setStatus(
     $("qw-status"),
     qw.syncInFlight ? "同步中" : qw.pending ? "等待验证" : "空闲",
-    qw.syncInFlight ? "warn" : qw.pending ? "warn" : ""
+    qw.syncInFlight ? "warn" : qw.pending ? "warn" : "",
   );
   setRow("qw-host-row", "qw-host", qw.verificationHost);
   const qwp = pp.qwen || {};
   setRow("qw-p-conv-row", "qw-p-conv", p ? shortId(qwp.conversation_id) : "");
-  setRow("qw-p-acct-row", "qw-p-acct", p && qwp.auth ? shortId(qwp.auth.account_id) : "");
+  setRow(
+    "qw-p-acct-row",
+    "qw-p-acct",
+    p && qwp.auth ? shortId(qwp.auth.account_id) : "",
+  );
   setRow("qw-p-auth-row", "qw-p-auth", p ? authText(qwp.auth) : "");
   setNewButton("qwen", Boolean(qwp.conversation_id));
 
@@ -124,25 +142,80 @@ function render(state) {
   const db = state.doubao || {};
   let dbCls = "";
   let dbText = "空闲";
-  if (db.authRequired) { dbText = "需要刷新状态"; dbCls = "err"; }
-  if (db.syncInFlight) { dbText = "同步中"; dbCls = "warn"; }
+  if (db.authRequired) {
+    dbText = "需要刷新状态";
+    dbCls = "err";
+  }
+  if (db.syncInFlight) {
+    dbText = "同步中";
+    dbCls = "warn";
+  }
   setStatus($("db-status"), dbText, dbCls);
 
   const cap = db.lastCapture;
   $("db-live-block").hidden = !cap;
   if (cap) {
-    $("db-conv").textContent = `${shortId(cap.conversation_id)}｜${agoText(cap.completedAt)}`;
+    $("db-conv").textContent =
+      `${shortId(cap.conversation_id)}｜${agoText(cap.completedAt)}`;
     $("db-index").textContent = String(cap.last_message_index);
     $("db-complete").textContent = cap.error
       ? `错误：${cap.error}`
-      : cap.complete ? "是" : "否";
+      : cap.complete
+        ? "是"
+        : "否";
   }
   const dbp = pp.doubao || {};
   setRow("db-p-conv-row", "db-p-conv", p ? shortId(dbp.conversation_id) : "");
   setRow("db-p-auth-row", "db-p-auth", p ? authText(dbp.auth) : "");
   setNewButton("doubao", Boolean(dbp.conversation_id));
 
-  const canSync = Boolean(cap && cap.complete && !cap.error) && !db.syncInFlight;
+  // ---------------- M365 Copilot ----------------
+  const m365 = state.m365 || {};
+  const m365p = pp.m365 || {};
+  const m365Ids = m365p.conversations_by_tone || {};
+  const m365Ready = Boolean(m365.bridgeConnected && m365.authAvailable);
+  let m365Text = "等待 M365 页面与认证";
+  let m365Class = "warn";
+  if (m365Ready) {
+    m365Text = "已就绪";
+    m365Class = "ok";
+  } else if (!m365.bridgeConnected) {
+    m365Text = "Bridge 未连接";
+    m365Class = "err";
+  } else if (!m365.authAvailable) {
+    m365Text = "等待登录凭证";
+    m365Class = "warn";
+  }
+  setStatus($("m365-status"), m365Text, m365Class);
+  setRow("m365-tenant-row", "m365-tenant", m365.tenantId);
+  setRow("m365-client-row", "m365-client", m365.clientId);
+  setRow(
+    "m365-auth-time-row",
+    "m365-auth-time",
+    m365.authUpdatedAt ? agoText(m365.authUpdatedAt) : "",
+  );
+  setRow(
+    "m365-refresh-error-row",
+    "m365-refresh-error",
+    m365.lastRefreshError
+      ? `${m365.lastRefreshError}｜${agoText(m365.lastRefreshErrorAt)}`
+      : "",
+  );
+  setRow("m365-opus-row", "m365-opus", shortId(m365Ids.Claude_Opus));
+  setRow("m365-sonnet-row", "m365-sonnet", shortId(m365Ids.Claude_Sonnet));
+  setRow("m365-gpt56-row", "m365-gpt56", shortId(m365Ids.Gpt_5_6_Reasoning));
+  setRow("m365-gpt55-row", "m365-gpt55", shortId(m365Ids.Gpt_5_5_Chat));
+  const anyM365Conversation = Boolean(
+    m365Ids.Claude_Opus ||
+    m365Ids.Claude_Sonnet ||
+    m365Ids.Gpt_5_6_Reasoning ||
+    m365Ids.Gpt_5_5_Chat,
+  );
+  setNewButton("m365", anyM365Conversation);
+  $("m365-clear-auth").disabled = !m365.authAvailable;
+
+  const canSync =
+    Boolean(cap && cap.complete && !cap.error) && !db.syncInFlight;
   const btn = $("sync-doubao");
   btn.hidden = !cap;
   btn.disabled = !canSync;
@@ -151,7 +224,9 @@ function render(state) {
 
 async function refresh() {
   try {
-    const state = await browser.runtime.sendMessage({ type: "POPUP_GET_STATE" });
+    const state = await browser.runtime.sendMessage({
+      type: "POPUP_GET_STATE",
+    });
     render(state);
   } catch (e) {
     $("native-text").textContent = "读取后台失败：" + ((e && e.message) || e);
@@ -169,7 +244,9 @@ async function syncDoubao() {
   setHint("正在同步…");
   $("sync-doubao").disabled = true;
   try {
-    const res = await browser.runtime.sendMessage({ type: "POPUP_SYNC_DOUBAO" });
+    const res = await browser.runtime.sendMessage({
+      type: "POPUP_SYNC_DOUBAO",
+    });
     if (res && res.ok) setHint("已提交同步请求。", "ok");
     else setHint(res && res.error ? res.error : "同步失败", "err");
   } catch (e) {
@@ -178,15 +255,20 @@ async function syncDoubao() {
   setTimeout(refresh, 400);
 }
 
-async function newConversation(provider) {
-  const btn = document.querySelector(`.ve-new[data-new="${provider}"]`);
+async function newConversation(provider, modelType, button) {
+  const btn =
+    button || document.querySelector(`.ve-new[data-new="${provider}"]`);
   const original = btn ? btn.textContent : "";
-  if (btn) { btn.disabled = true; btn.textContent = "处理中…"; }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "处理中…";
+  }
   try {
     const res = await browser.runtime.sendMessage({
       type: "POPUP_MUTATE",
       action: "new",
-      provider
+      provider,
+      model_type: modelType || "",
     });
     if (btn) btn.textContent = res && res.ok ? "已清除" : "失败";
   } catch (_) {
@@ -200,8 +282,29 @@ async function newConversation(provider) {
   }, 1200);
 }
 
+async function clearM365Auth() {
+  const btn = $("m365-clear-auth");
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "处理中…";
+  try {
+    const res = await browser.runtime.sendMessage({
+      type: "POPUP_CLEAR_M365_AUTH",
+    });
+    btn.textContent = res && res.ok ? "已清除" : "失败";
+  } catch (_) {
+    btn.textContent = "失败";
+  }
+  setTimeout(() => {
+    btn.textContent = original;
+    refresh();
+  }, 900);
+}
+
 async function reconnect() {
-  try { await browser.runtime.sendMessage({ type: "POPUP_RECONNECT" }); } catch (_) {}
+  try {
+    await browser.runtime.sendMessage({ type: "POPUP_RECONNECT" });
+  } catch (_) {}
   setTimeout(refresh, 500);
 }
 
@@ -218,11 +321,20 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh").addEventListener("click", refresh);
   $("reconnect").addEventListener("click", reconnect);
   $("sync-doubao").addEventListener("click", syncDoubao);
+  $("m365-clear-auth").addEventListener("click", clearM365Auth);
   for (const b of document.querySelectorAll(".ve-open")) {
-    b.addEventListener("click", () => openProvider(b.getAttribute("data-open")));
+    b.addEventListener("click", () =>
+      openProvider(b.getAttribute("data-open")),
+    );
   }
   for (const b of document.querySelectorAll(".ve-new")) {
-    b.addEventListener("click", () => newConversation(b.getAttribute("data-new")));
+    b.addEventListener("click", () =>
+      newConversation(
+        b.getAttribute("data-new"),
+        b.getAttribute("data-model") || "",
+        b,
+      ),
+    );
   }
   refresh();
   const timer = setInterval(refresh, 2000);

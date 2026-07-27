@@ -4,7 +4,7 @@ const MODEL_TYPES = new Set(["default", "expert", "vision"]);
 const MODEL_LABELS = new Map([
   ["快速模式", "default"],
   ["专家模式", "expert"],
-  ["识图模式", "vision"]
+  ["识图模式", "vision"],
 ]);
 const CONVERSATION_PATH_RE = /^\/a\/chat\/s\/([^/?#]+)/;
 const SNAPSHOT_DELAY_MS = 120;
@@ -31,10 +31,10 @@ function textModelType(root = document) {
 }
 
 function hasToggleLabel(label) {
-  return [...document.querySelectorAll('[aria-pressed]')].some(element =>
-    [...element.querySelectorAll('span')].some(
-      span => String(span.textContent || '').trim() === label
-    )
+  return [...document.querySelectorAll("[aria-pressed]")].some((element) =>
+    [...element.querySelectorAll("span")].some(
+      (span) => String(span.textContent || "").trim() === label,
+    ),
   );
 }
 
@@ -44,7 +44,9 @@ function capabilityModelType() {
   // expert has neither. Deep Thinking is intentionally ignored because all
   // three modes expose it.
   const hasSearch = hasToggleLabel("智能搜索");
-  const hasUpload = Boolean(document.querySelector('input[type="file"][multiple]'));
+  const hasUpload = Boolean(
+    document.querySelector('input[type="file"][multiple]'),
+  );
   if (hasSearch && hasUpload) return "default";
   if (!hasSearch && hasUpload) return "vision";
   if (!hasSearch && !hasUpload) return "expert";
@@ -54,7 +56,7 @@ function capabilityModelType() {
 function detectModelType() {
   // New/unsubmitted conversations expose the interactive radio group.
   const selected = document.querySelector(
-    '[role="radio"][data-model-type][aria-checked="true"]'
+    '[role="radio"][data-model-type][aria-checked="true"]',
   );
   const selectedType = selected && selected.getAttribute("data-model-type");
   if (MODEL_TYPES.has(selectedType)) return selectedType;
@@ -78,7 +80,7 @@ function currentDeepSeekConversationSnapshot() {
     conversation_id: conversationId,
     model_type: modelType,
     page_url: location.href,
-    captured_at: Date.now()
+    captured_at: Date.now(),
   };
 }
 
@@ -103,9 +105,10 @@ function scheduleSnapshot() {
 
 function findModeRoot() {
   const selected = document.querySelector(
-    '[role="radio"][data-model-type][aria-checked="true"]'
+    '[role="radio"][data-model-type][aria-checked="true"]',
   );
-  if (selected) return selected.closest('[role="radiogroup"]') || selected.parentElement;
+  if (selected)
+    return selected.closest('[role="radiogroup"]') || selected.parentElement;
 
   for (const span of document.querySelectorAll("span")) {
     if (!MODEL_LABELS.has(String(span.textContent || "").trim())) continue;
@@ -127,13 +130,18 @@ function attachModeObserver() {
     childList: true,
     characterData: true,
     attributes: true,
-    attributeFilter: ["aria-checked", "data-model-type"]
+    attributeFilter: ["aria-checked", "data-model-type"],
   });
 }
 
-document.addEventListener("click", event => {
-  if (event.target.closest('[role="radio"][data-model-type]')) scheduleSnapshot();
-}, true);
+document.addEventListener(
+  "click",
+  (event) => {
+    if (event.target.closest('[role="radio"][data-model-type]'))
+      scheduleSnapshot();
+  },
+  true,
+);
 
 // DeepSeek uses history-based SPA navigation. Poll only the pathname, then
 // re-discover the small mode subtree after a conversation change.
