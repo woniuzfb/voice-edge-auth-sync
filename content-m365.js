@@ -11,26 +11,46 @@
  *     M365_ASK 到来 → 使用 Python 指定的 ConversationId，空值则新建
  *       → 在正确的 outlook.office.com frame 建立 page-world Chathub WebSocket
  *       → 握手 {"protocol":"json","version":1}\x1e → 收 {} → 发 chat+Metrics 帧
- *       → 读 update 流(writeAtCursor / messages 快照取最长)→ type2/type3 收尾
+ *       → 按 cursor messageId 读取正文快照/writeAtCursor 增量→ type2/type3 收尾
  * ========================================================================= */
 (() => {
   "use strict";
 
   function PAGE_HOOK() {
     "use strict";
+    // Origin self-gate. The manifest injects this script into every frame of
+    // three match origins (outlook.cloud.microsoft, m365.cloud.microsoft,
+    // outlook.office.com) with all_frames:true, so every host-shell subframe
+    // also advertises itself as a Chathub-socket candidate. Only the
+    // outlook.office.com frame ever builds the working socket (observed
+    // frameOrigin in every VE-FRAME-READY). We therefore BLOCK the two proven
+    // host-shell origins from advertising as socket candidates, and FAIL OPEN
+    // for outlook.office.com and any unforeseen origin — gating can only ever
+    // remove known-noise candidates, never suppress a frame that might be the
+    // real one, so it cannot break connectivity. Entry discovery
+    // (M365_ENTRY_DISCOVERED) is deliberately NOT gated: it must keep reporting
+    // from the shell origin.
+    const M365_SHELL_ORIGINS = {
+      "https://outlook.cloud.microsoft": true,
+      "https://m365.cloud.microsoft": true,
+    };
+    const frameMayHostSocket = () =>
+      M365_SHELL_ORIGINS[location.origin] !== true;
     const priorHook = window.__veM365Hook;
     if (priorHook && priorHook.ready === true) {
-      window.postMessage(
-        {
-          __veM365: true,
-          dir: "fromPage",
-          type: "M365_FRAME_READY",
-          capabilities: priorHook.capabilities,
-          frameOrigin: location.origin,
-          frameUrl: location.href,
-        },
-        "*",
-      );
+      if (frameMayHostSocket()) {
+        window.postMessage(
+          {
+            __veM365: true,
+            dir: "fromPage",
+            type: "M365_FRAME_READY",
+            capabilities: priorHook.capabilities,
+            frameOrigin: location.origin,
+            frameUrl: location.href,
+          },
+          "*",
+        );
+      }
       return;
     }
     // Do not advertise readiness until every handler below has been installed.
@@ -143,6 +163,44 @@
         Object.assign({ __veM365: true, dir: "fromPage" }, m),
         "*",
       );
+    // Gated page-world tracing. OFF by default; enable live from the page
+    // console with `window.__veM365Debug = true` (no reload). Focused on the
+    // conversation-id decision and terminal signal.
+    const dbg = (...a) => {
+      try {
+        if (window.__veM365Debug) console.log("[VE-m365][dbg]", ...a);
+      } catch (_) {}
+    };
+
+    // ---- Artifact auth capture ------------------------------------------
+    // Downloading a CodeInterpreter artifact from the AMS object endpoint
+    // (asyncgw.teams.microsoft.com/v1/objects/…) needs the SAME bearer the page
+    // itself uses — NOT the sydney token (wrong audience -> 401) and NOT cookies
+    // (also 401). Rather than guess the audience, we passively reuse the page's
+    // own successful request in two ways, both with the page's real auth:
+    //   1) _amsBytes : if the page fetches the object itself (to build its blob
+    //      download), we tee those exact bytes — zero auth guessing.
+    //   2) _amsPageAuth : the Authorization header the page attaches to any AMS
+    //      request, captured from both fetch and XHR, reused for our own GET of
+    //      artifact URLs the page did not fetch.
+    const AMS_OBJECT_URL_RE = /^https:\/\/[^/]*asyncgw[^/]*\/v1\/objects\//i;
+    const normalizeAmsUrl = (u) =>
+      String(u || "").replace(/(\/views\/original)\/[^/?#]*(?=$|[?#])/i, "$1");
+    let _amsPageAuth = ""; // most recent "Bearer …" the page used for AMS
+    const _amsBytes = new Map(); // normalized url -> base64 (teed from page)
+    const bufToB64 = (buf) => {
+      const b = new Uint8Array(buf);
+      let bin = "";
+      const CH = 0x8000;
+      for (let i = 0; i < b.length; i += CH)
+        bin += String.fromCharCode.apply(null, b.subarray(i, i + CH));
+      return btoa(bin);
+    };
+    const rememberAmsAuth = (auth) => {
+      const s = String(auth || "");
+      if (/^Bearer\s+\S/i.test(s)) _amsPageAuth = s;
+    };
+    // ---------------------------------------------------------------------
 
     // ---- 捕获页面 token fetch 的成功响应，保存服务端轮换后的 refresh_token ----
     (function hookTokenFetch() {
@@ -151,6 +209,40 @@
 
       async function wrappedFetch(input, init) {
         const response = await originalFetch.apply(this, arguments);
+        // Passively reuse the page's own AMS auth/bytes (see _amsBytes /
+        // _amsPageAuth above). Never blocks or alters the page's response.
+        try {
+          const reqHref =
+            typeof input === "string" ? input : (input && input.url) || "";
+          if (AMS_OBJECT_URL_RE.test(reqHref)) {
+            // capture the page's bearer for this AMS request
+            let auth = "";
+            if (init && init.headers) {
+              const h = init.headers;
+              auth =
+                typeof h.get === "function"
+                  ? h.get("Authorization") || h.get("authorization")
+                  : h.Authorization || h.authorization || "";
+            }
+            if (
+              !auth &&
+              typeof Request !== "undefined" &&
+              input instanceof Request
+            )
+              auth = input.headers.get("Authorization") || "";
+            rememberAmsAuth(auth);
+            // tee the exact bytes the page just downloaded (best case)
+            if (response && response.ok) {
+              response
+                .clone()
+                .arrayBuffer()
+                .then((buf) =>
+                  _amsBytes.set(normalizeAmsUrl(reqHref), bufToB64(buf)),
+                )
+                .catch(() => {});
+            }
+          }
+        } catch (_) {}
         try {
           const requestUrl = new URL(
             typeof input === "string" ? input : (input && input.url) || "",
@@ -213,11 +305,24 @@
     (function hookXHR() {
       const O = XMLHttpRequest.prototype.open;
       const S = XMLHttpRequest.prototype.send;
+      const SRH = XMLHttpRequest.prototype.setRequestHeader;
       XMLHttpRequest.prototype.open = function (method, url) {
         try {
           this.__veUrl = String(url || "");
         } catch (_) {}
         return O.apply(this, arguments);
+      };
+      // Capture the page's bearer if it downloads the AMS object over XHR
+      // (covers the case where the download path is XHR rather than fetch).
+      XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+        try {
+          if (
+            String(name || "").toLowerCase() === "authorization" &&
+            AMS_OBJECT_URL_RE.test(this.__veUrl || "")
+          )
+            rememberAmsAuth(value);
+        } catch (_) {}
+        return SRH.apply(this, arguments);
       };
       XMLHttpRequest.prototype.send = function () {
         try {
@@ -270,16 +375,39 @@
         }, 15000);
       });
     }
+    // AMS/artifact token bridge. The AMS object endpoint requires an IC3-
+    // audience token (aud=ic3.teams.office.com); the Sydney token 401s there.
+    // Mirrors requestSydneyToken but over the M365_NEED_AMS_TOKEN channel.
+    let _amsTokenCache = { token: "", exp: 0 };
+    const _amsTokenWaiters = [];
+    function requestAmsToken() {
+      return new Promise((resolve, reject) => {
+        if (_amsTokenCache.token && _amsTokenCache.exp - Date.now() > 90000) {
+          return resolve(_amsTokenCache.token);
+        }
+        _amsTokenWaiters.push({ resolve, reject });
+        post({ type: "M365_NEED_AMS_TOKEN" });
+        setTimeout(() => {
+          const i = _amsTokenWaiters.findIndex((w) => w.resolve === resolve);
+          if (i >= 0) {
+            _amsTokenWaiters.splice(i, 1);
+            reject(new Error("ams token timeout"));
+          }
+        }, 15000);
+      });
+    }
     // background 回传 token
     window.addEventListener("message", (ev) => {
       const d = ev.data;
       if (!d || d.__veM365 !== true || d.dir !== "toPage") return;
       if (d.type === "M365_PROBE") {
-        post({
-          type: "M365_FRAME_READY",
-          frameOrigin: location.origin,
-          frameUrl: location.href,
-        });
+        if (frameMayHostSocket()) {
+          post({
+            type: "M365_FRAME_READY",
+            frameOrigin: location.origin,
+            frameUrl: location.href,
+          });
+        }
       } else if (d.type === "M365_TOKEN") {
         _tokenCache = { token: String(d.token || ""), exp: Number(d.exp || 0) };
         while (_tokenWaiters.length) {
@@ -287,6 +415,17 @@
           _tokenCache.token
             ? w.resolve(_tokenCache.token)
             : w.reject(new Error(d.error || "no token"));
+        }
+      } else if (d.type === "M365_AMS_TOKEN") {
+        _amsTokenCache = {
+          token: String(d.token || ""),
+          exp: Number(d.exp || 0),
+        };
+        while (_amsTokenWaiters.length) {
+          const w = _amsTokenWaiters.shift();
+          _amsTokenCache.token
+            ? w.resolve(_amsTokenCache.token)
+            : w.reject(new Error(d.error || "no ams token"));
         }
       } else if (d.type === "M365_ASK") {
         doAsk(
@@ -528,6 +667,15 @@
 
         // Python selects an existing ID; empty means create a new conversation.
         const convId = conversationId || uuid();
+        dbg(
+          "doAsk id=%s tone=%s convId=%s (%s) attachments=%d textLen=%d",
+          id,
+          tone,
+          convId,
+          conversationId ? "reused-from-python" : "new-uuid",
+          Array.isArray(attachments) ? attachments.length : 0,
+          String(text || "").length,
+        );
 
         const sid = uuid(),
           reqSess = uuid();
@@ -562,26 +710,416 @@
         ws = new WebSocket(url); // browser supplies this frame's Origin
         const { args } = buildChatArgs(text, tone, convId, attachments);
         const invId = "0"; // 全新 socket,首个调用用 "0"(每 socket 只发一轮)
-        let best = "";
-        let cursorText = "";
+        // The answer may be delivered across MULTIPLE messageIds within a
+        // single turn: when the model takes a tool-call / reasoning break, the
+        // server closes one answer message and continues under a NEW messageId.
+        // Each message's `text` is independently append-only, but the second
+        // message does NOT start with the first — so a single cumulative `best`
+        // guarded by startsWith() would reject the entire second segment and
+        // freeze the answer. We therefore accumulate PER SEGMENT:
+        //   committed = concatenation of all finished (superseded) segments
+        //   curId/curBest = the messageId and cumulative text of the segment
+        //                   currently streaming
+        // and publish committed + curBest. This total is still strictly
+        // append-only across the whole turn (committed only grows, curBest is
+        // prefix-monotonic within its segment), so the Python relay's
+        // incremental text[len(best):] contract is preserved.
+        let committed = "";
+        let curId = "";
+        let curBest = "";
+        const totalText = () => committed + curBest;
+        // Chain-of-thought accumulator — MIRRORS the answer accumulator above,
+        // but on the reasoning channel. The model's real reasoning is delivered
+        // as Progress frames flagged addToChainOfThought:true, cumulative per
+        // messageId, and spanning MULTIPLE messageIds per turn (observed:
+        // 10 CoT messageIds interleaved with 5 answer messageIds). Forwarding
+        // each frame's raw text would hit the SAME island-loss bug as C4 on the
+        // Python side (its len(text) > len(best_reasoning) guard drops a shorter
+        // new-segment snapshot), so we accumulate committed + current exactly
+        // like the answer and emit the cumulative TOTAL as M365_REASONING.
+        // Distinct thought bursts (messageId switches / non-prefix rewrites) are
+        // joined with a blank line for readability; the total stays strictly
+        // append-only so the Python reasoning slice text[len(best_reasoning):]
+        // remains correct. This never reads or writes the answer channel.
+        let cotCommitted = "";
+        let cotCurId = "";
+        let cotCurBest = "";
+        const cotTotal = () => cotCommitted + cotCurBest;
+        const commitCotSegment = () => {
+          if (cotCurBest) cotCommitted += cotCurBest + "\n\n";
+          cotCurBest = "";
+        };
+        const publishReasoning = (candidate, messageId) => {
+          const value = String(candidate || "");
+          if (!value) return;
+          const mid = String(messageId || cotCurId || "");
+          if (!cotCurId) {
+            cotCurId = mid;
+          } else if (mid && mid !== cotCurId) {
+            commitCotSegment(); // new messageId -> new thought burst
+            cotCurId = mid;
+          }
+          if (value === cotCurBest) return;
+          if (value.startsWith(cotCurBest)) {
+            cotCurBest = value; // in-segment growth (prefix-monotonic)
+          } else {
+            commitCotSegment(); // non-prefix rewrite -> start a fresh burst
+            cotCurBest = value;
+          }
+          post({
+            type: "M365_REASONING",
+            id,
+            text: cotTotal(),
+            messageId: mid,
+          });
+        };
+        // True once we have accepted at least one authoritative cumulative
+        // snapshot for the CURRENT segment. While snapshots are flowing they are
+        // the single source of truth; writeAtCursor deltas are a redundant
+        // *provisional* view that can diverge (e.g. unresolved citation
+        // placeholders like 【1-xxxx】 the server later rewrites to the canonical
+        // \ue200cite\ue202…\ue201 form). Mixing them poisons the segment and
+        // makes later authoritative snapshots fail the prefix guard.
+        let sawSnapshot = false;
+        let activeAnswerMessageId = "";
+        // Switch the active segment when the server moves to a new answer
+        // messageId. The finished segment is committed verbatim; NO prefix check
+        // is applied across segments (that is exactly the bug that dropped the
+        // continuation). Within a segment, prefix-monotonicity still holds.
+        const ensureSegment = (messageId) => {
+          const mid = String(messageId || activeAnswerMessageId || curId || "");
+          if (!mid) return;
+          if (!curId) {
+            curId = mid;
+          } else if (mid !== curId) {
+            committed += curBest;
+            curBest = "";
+            curId = mid;
+            sawSnapshot = false; // snapshot-vs-writeAtCursor is per segment
+          }
+        };
         let handshook = false;
         let terminal = false;
-        let timeoutTimer = null;
-        const publishLongest = (candidate) => {
-          const value = String(candidate || "");
-          if (value.length > best.length) {
-            best = value;
-            post({ type: "M365_DELTA", id, text: best });
+        // ---- Artifact harvesting ---------------------------------------
+        // Capture the files THIS turn produced (CodeInterpreter / present_files
+        // output) and forward their bytes so the background can upload them to
+        // the SharePoint "download" folder. The real download URLs arrive inside
+        // the answer message as sourceAttributions[*].seeMoreUrl and/or
+        // references[*].targetLink, pointing at
+        // asyncgw.teams.microsoft.com/v1/objects/… (verified in captures
+        // references.targetLink, sourceAttributions.seeMoreUrl;
+        // the field varies per turn, so BOTH are scanned). Those URLs are
+        // fetchable with a bare, credential-less GET from this outlook.office.com
+        // page origin (probe verified: default GET -> 200 + bytes;
+        // credentials:include -> 401). URLs are collected while parsing frames
+        // and fetched once at terminal, off the answer path.
+        const artifactUrls = new Set();
+        let artifactsHarvested = false;
+        const AMS_OBJECT_RE =
+          /https:\/\/[^"'\s]*asyncgw[^"'\s]*\/v1\/objects\/[^"'\s]*/i;
+        const collectArtifacts = (message) => {
+          if (!message || typeof message !== "object") return;
+          const scan = (url) => {
+            const s = String(url || "");
+            if (AMS_OBJECT_RE.test(s)) artifactUrls.add(s);
+          };
+          const sa = message.sourceAttributions;
+          if (Array.isArray(sa)) for (const s of sa) if (s) scan(s.seeMoreUrl);
+          const refs = message.references;
+          if (refs && typeof refs === "object")
+            for (const k of Object.keys(refs)) {
+              const r = refs[k];
+              if (r) scan(r.targetLink);
+            }
+        };
+        const artifactNameFromUrl = (url, disposition) => {
+          const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(
+            String(disposition || ""),
+          );
+          if (m && m[1]) return decodeURIComponent(m[1].trim());
+          const parts = String(url).split("?")[0].split("/").filter(Boolean);
+          const last = parts[parts.length - 1] || "";
+          // ".../views/original[/<name>]" — "original" means no trailing name.
+          return last && last.toLowerCase() !== "original"
+            ? decodeURIComponent(last)
+            : "artifact-" + Date.now();
+        };
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const harvestOne = async (url) => {
+          // The AMS endpoint serves bytes at ".../views/original"; the captured
+          // link often appends the display filename, and that longer path 404s.
+          // Normalize the request target but keep `url` for name/logging.
+          const fetchUrl = normalizeAmsUrl(url);
+          // BEST CASE: the page downloads the object itself (to build its blob
+          // link); wrappedFetch tees those exact bytes with the page's real
+          // auth. Poll briefly since that download may land shortly AFTER the
+          // answer terminates.
+          for (let i = 0; i < 12; i++) {
+            const b64 = _amsBytes.get(fetchUrl);
+            if (b64) {
+              post({
+                type: "M365_ARTIFACT",
+                id,
+                url,
+                name: artifactNameFromUrl(url, null),
+                size: (function () {
+                  try {
+                    return atob(b64).length;
+                  } catch (_) {
+                    return 0;
+                  }
+                })(),
+                mimeType: "application/octet-stream",
+                data: b64,
+                source: "page-tee",
+              });
+              return;
+            }
+            await sleep(500);
           }
+          // FALLBACK: fetch it ourselves. Prefer the exact bearer the page used
+          // for AMS (captured from its fetch/XHR — guaranteed-correct audience).
+          // If the page never issued an AMS request (common for artifacts the
+          // page does not auto-download), acquire an IC3-audience token
+          // (aud=ic3.teams.office.com), the audience the AMS object endpoint
+          // requires. The Sydney token is deliberately NOT used here: its
+          // audience (substrate.office.com/sydney) is rejected by AMS with 401 —
+          // that was the harvestArtifacts failure.
+          let auth = _amsPageAuth;
+          if (!auth) {
+            try {
+              const t = await requestAmsToken();
+              if (t) auth = "Bearer " + t;
+            } catch (_) {}
+          }
+          const headers = { Accept: "*/*", "MS-IC3-Product": "Copilot" };
+          if (auth) headers["Authorization"] = auth;
+          try {
+            const res = await fetch(fetchUrl, {
+              method: "GET",
+              credentials: "omit",
+              headers,
+            });
+            if (!res.ok)
+              return post({
+                type: "M365_ARTIFACT_ERROR",
+                id,
+                url,
+                fetchUrl,
+                error: "fetch " + res.status,
+                usedPageAuth: auth === _amsPageAuth && !!_amsPageAuth,
+              });
+            const buf = await res.arrayBuffer();
+            post({
+              type: "M365_ARTIFACT",
+              id,
+              url,
+              name: artifactNameFromUrl(
+                url,
+                res.headers.get("content-disposition"),
+              ),
+              size: buf.byteLength,
+              mimeType:
+                res.headers.get("content-type") || "application/octet-stream",
+              data: bufToB64(buf),
+              source: auth ? "authed-fetch" : "bare-fetch",
+            });
+          } catch (e) {
+            post({
+              type: "M365_ARTIFACT_ERROR",
+              id,
+              url,
+              fetchUrl,
+              error: String((e && e.message) || e),
+            });
+          }
+        };
+        const harvestArtifacts = () => {
+          if (artifactsHarvested) return;
+          artifactsHarvested = true;
+          if (!artifactUrls.size) return;
+          for (const url of artifactUrls) harvestOne(url);
+        };
+        // ----------------------------------------------------------------
+        let timeoutTimer = null;
+        let completionFallbackTimer = null;
+        let type2ConversationId = "";
+        let type2TurnState = "";
+        const cursorMessageId = (cursor) => {
+          const path = String((cursor && cursor.j) || "");
+          // Example: $['66f8...'].adaptiveCards[0].body[0].text
+          const match = /^\$\[['"]([^'"]+)['"]\]/.exec(path);
+          return match ? match[1] : "";
+        };
+        // Citation-form normalizer. The server first streams an UNRESOLVED
+        // placeholder (e.g. 【1-turn1file1】) and later REWRITES it IN PLACE to
+        // the resolved private-use form \ue200cite\ue202…\ue201. Both encode the
+        // same citation, so we collapse either span to one neutral token before
+        // any prefix comparison. This lets an in-place citation rewrite be seen
+        // as forward progress instead of a token retraction.
+        const CITE_TOKEN = "\ue200\ue201";
+        const stripCites = (s) =>
+          String(s)
+            .replace(/\ue200[\s\S]*?\ue201/g, CITE_TOKEN) // resolved cite span
+            .replace(/【\d+-[^】]*】/g, CITE_TOKEN); // unresolved placeholder
+        const publishSnapshot = (candidate, source, messageId) => {
+          const value = String(candidate || "");
+          if (!value) return;
+          // Route the snapshot to its segment first; a new messageId commits the
+          // previous segment instead of being rejected as "non-prefix".
+          ensureSegment(messageId);
+          if (value === curBest) return;
+          // Within the current segment the answer is append-only. A stale/short
+          // or non-prefix rewrite of the SAME segment cannot be represented
+          // without retracting tokens, so it is ignored — but this guard is now
+          // scoped to curBest, never to text from an earlier segment.
+          if (!value.startsWith(curBest)) {
+            // Citation-aware retry: the divergence may be nothing more than the
+            // server resolving 【1-xxxx】 into the \ue200cite\ue202…\ue201 form
+            // at a position already inside curBest. With citation spans
+            // neutralized, a genuine append still shows the current segment as a
+            // prefix; if it does, this is a citation resolution (real forward
+            // progress, no tokens retracted) and we adopt the newer, resolved
+            // value. Only a normalized non-prefix is a true retraction/rewrite
+            // that append-only cannot represent, so only that is dropped.
+            if (!stripCites(value).startsWith(stripCites(curBest))) {
+              console.warn("[VE-m365] ignored non-prefix answer snapshot", {
+                source,
+                messageId: curId,
+                currentSegmentLength: curBest.length,
+                incomingLength: value.length,
+              });
+              return;
+            }
+          }
+          curBest = value;
+          sawSnapshot = true;
+          post({
+            type: "M365_DELTA",
+            id,
+            text: totalText(),
+            deltaSource: source,
+          });
+        };
+        const publishCursorDelta = (delta) => {
+          const value = String(delta || "");
+          if (!value || !activeAnswerMessageId) return;
+          // writeAtCursor is only used as a low-latency fallback for servers
+          // that stream *without* periodic cumulative snapshots. The moment a
+          // single authoritative snapshot has been seen for this segment, the
+          // snapshot stream owns it and we must stop appending provisional
+          // deltas — otherwise unresolved fragments (citation placeholders,
+          // pre-redaction text) get permanently baked in and the corrective
+          // snapshots that follow are rejected by the prefix guard.
+          ensureSegment(activeAnswerMessageId);
+          if (sawSnapshot) return;
+          curBest += value;
+          post({
+            type: "M365_DELTA",
+            id,
+            text: totalText(),
+            deltaSource: "writeAtCursor",
+            messageId: activeAnswerMessageId,
+          });
+        };
+        const finalTextFromType2 = (item) => {
+          const result = (item && item.result) || {};
+          if (typeof result.message === "string" && result.message)
+            return result.message;
+          if (Array.isArray(item && item.messages)) {
+            const exact = item.messages.find(
+              (message) =>
+                message &&
+                message.messageId === activeAnswerMessageId &&
+                String(message.messageType || "").toLowerCase() !==
+                  "progress" &&
+                typeof message.text === "string",
+            );
+            if (exact) return exact.text;
+          }
+          return "";
         };
         const done = (payload) => {
           if (terminal) return;
           terminal = true;
+          try {
+            dbg(
+              "done id=%s type=%s convId=%s signal=%s authoritative=%s turnState=%s textLen=%d%s",
+              id,
+              payload && payload.type,
+              (payload && payload.conversationId) || convId,
+              (payload && payload.completionSignal) || "",
+              !!(payload && payload.authoritative),
+              (payload && payload.turnState) || "",
+              payload && typeof payload.text === "string"
+                ? payload.text.length
+                : 0,
+              payload && payload.error ? " error=" + payload.error : "",
+            );
+          } catch (_) {}
+          // Fire-and-forget: harvest any artifact download URLs seen this turn.
+          // Runs over HTTP, independent of the ws we are about to close; posts
+          // M365_ARTIFACT messages that background uploads to SharePoint. Never
+          // blocks or alters the terminal payload below.
+          try {
+            harvestArtifacts();
+          } catch (_) {}
+          // Tell background how many artifacts this turn produced BEFORE the
+          // terminal is forwarded. Each M365_ARTIFACT / M365_ARTIFACT_ERROR
+          // for this id arrives asynchronously (harvestOne polls page-tee'd
+          // bytes for up to ~6s, sometimes AFTER this DONE), so background
+          // cannot otherwise know whether to wait for SharePoint links before
+          // finalizing. 0 (no artifacts) keeps the streaming path a strict
+          // no-op. Only meaningful on the authoritative M365_DONE payload.
+          try {
+            if (payload && payload.type === "M365_DONE") {
+              payload.artifactCount = artifactUrls.size;
+            }
+          } catch (_) {}
           if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+          if (completionFallbackTimer !== null)
+            clearTimeout(completionFallbackTimer);
           try {
             ws.close();
           } catch (_) {}
           post(payload);
+        };
+        // Idle watchdog, not a wall-clock cap. The previous implementation armed
+        // a single 180s timeout at socket-open and never reset it, so a healthy
+        // but long/slow answer (e.g. Claude Opus reasoning with web/work search
+        // that legitimately streams for more than 180s of wall-clock) was killed
+        // mid-stream with "M365 websocket timeout", truncating the reply — the
+        // relay/consumer both showed the answer was byte-perfect up to the cut,
+        // then an extension-side M365_ERROR. Reset on EVERY received frame
+        // (including server type:6 pings) so this only fires when the socket is
+        // physically silent for the full window. Whether answer *content* is
+        // still arriving is a separate concern already enforced by the Python
+        // relay's content-based idle timeout, so the two layers do not overlap.
+        const IDLE_TIMEOUT_MS = 180000;
+        const armIdleTimeout = () => {
+          if (terminal) return;
+          if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+          timeoutTimer = setTimeout(
+            () =>
+              done({
+                type: "M365_ERROR",
+                id,
+                error: "M365 websocket idle timeout (no frames for 180s)",
+              }),
+            IDLE_TIMEOUT_MS,
+          );
+        };
+        const finishFromType2Fallback = () => {
+          completionFallbackTimer = null;
+          done({
+            type: "M365_DONE",
+            id,
+            text: totalText(),
+            conversationId: type2ConversationId || convId,
+            completionSignal: "type2-completed",
+            authoritative: true,
+            turnState: type2TurnState,
+          });
         };
 
         ws.onopen = () => {
@@ -597,6 +1135,10 @@
             });
         };
         ws.onmessage = (ev) => {
+          // Any inbound frame proves the socket is alive; reset the idle
+          // watchdog before processing it so a long/slow-but-healthy stream is
+          // never cut off mid-answer.
+          armIdleTimeout();
           const run = (s) => {
             for (const f of parseFrames(s)) {
               if (!handshook) {
@@ -634,34 +1176,134 @@
               } // ping→pong
               if (f.type === 1 && f.target === "update") {
                 const a = (f.arguments && f.arguments[0]) || {};
+                const selectedMessageId = cursorMessageId(a.cursor);
+                if (selectedMessageId)
+                  activeAnswerMessageId = selectedMessageId;
                 if (Array.isArray(a.messages))
                   for (const message of a.messages) {
-                    if (message.messageType === "Disengaged") {
+                    const messageType = String(
+                      message.messageType || "",
+                    ).toLowerCase();
+                    if (messageType === "disengaged") {
                       done({ type: "M365_ERROR", id, error: "Disengaged" });
                       return;
                     }
-                    if (typeof message.text === "string")
-                      publishLongest(message.text);
+                    // Scan every message for CodeInterpreter artifact download
+                    // URLs (sourceAttributions.seeMoreUrl / references.targetLink);
+                    // harmless on progress messages, which carry none.
+                    collectArtifacts(message);
+                    if (messageType === "progress") {
+                      // Preserve protocol visibility without contaminating the
+                      // append-only answer stream. The text is deliberately not
+                      // interpreted, so localization/new wording is irrelevant.
+                      post({
+                        type: "M365_PROGRESS",
+                        id,
+                        text: String(message.text || ""),
+                        messageId: String(message.messageId || ""),
+                        contentType: String(message.contentType || ""),
+                        // Forward the chain-of-thought flag so the Python relay
+                        // can distinguish the model's actual reasoning stream
+                        // (addToChainOfThought === true, cumulative per
+                        // messageId) from mere status placeholders such as
+                        // "请稍候…"/"正在思考..." (EarlyProgress, flag false).
+                        // Only the former should be surfaced as reasoning.
+                        addToChainOfThought:
+                          message.addToChainOfThought === true,
+                      });
+                      // Additionally surface the model's REAL reasoning as an
+                      // append-only M365_REASONING stream. Only frames flagged
+                      // addToChainOfThought:true carry genuine chain-of-thought;
+                      // EarlyProgress placeholders (flag false) stay liveness-
+                      // only above. The M365_PROGRESS post is left untouched, so
+                      // the existing keepalive/liveness path is unchanged — this
+                      // is purely additive and never touches the answer channel.
+                      if (
+                        message.addToChainOfThought === true &&
+                        typeof message.text === "string" &&
+                        message.text
+                      ) {
+                        publishReasoning(
+                          message.text,
+                          String(message.messageId || ""),
+                        );
+                      }
+                      continue;
+                    }
+                    // Adopt the first genuine answer message even if the
+                    // cursor frame has not arrived yet. Real answer messages
+                    // carry an empty messageType and empty contentType; this
+                    // deliberately excludes Progress / EscapeHatch ("Hide")
+                    // and typed cards. Without this, any answer token that
+                    // precedes the cursor frame is silently dropped — the
+                    // classic "first character of the reply is missing" bug.
+                    if (
+                      !activeAnswerMessageId &&
+                      !messageType &&
+                      !message.contentType &&
+                      message.messageId &&
+                      typeof message.text === "string"
+                    )
+                      activeAnswerMessageId = message.messageId;
+                    if (
+                      activeAnswerMessageId &&
+                      message.messageId === activeAnswerMessageId &&
+                      typeof message.text === "string"
+                    )
+                      publishSnapshot(
+                        message.text,
+                        "messages-snapshot",
+                        message.messageId,
+                      );
                   }
-                if (typeof a.writeAtCursor === "string") {
-                  cursorText += a.writeAtCursor;
-                  publishLongest(cursorText);
-                }
+                if (typeof a.writeAtCursor === "string")
+                  publishCursorDelta(a.writeAtCursor);
               } else if (f.type === 2) {
-                const res = (f.item && f.item.result) || {};
-                if (
-                  typeof res.message === "string" &&
-                  res.message.length > best.length
-                )
-                  best = res.message;
-                const cid = (f.item && f.item.conversationId) || convId;
-                done({
-                  type: "M365_DONE",
-                  id,
-                  text: best,
-                  conversationId: cid,
-                });
-                return;
+                const item = f.item || {};
+                const result = (item && item.result) || {};
+                if (typeof result.message === "string" && result.message) {
+                  // AUTHORITATIVE full-turn text: this is the server's final
+                  // message with citations already resolved — the single source
+                  // of truth for the whole answer. Adopt it WHOLESALE and bypass
+                  // the append-only prefix guard (that guard exists for
+                  // provisional streaming snapshots, not for the final message).
+                  // This is the core fix: previously result.message was fed back
+                  // through publishSnapshot and rejected as "non-prefix" when it
+                  // resolved 【1-xxxx】 into the \ue200cite…\ue201 form, freezing
+                  // the answer at the citation and dropping the tail. totalText()
+                  // (used by the type=3 DONE below) now equals this full text.
+                  committed = result.message;
+                  curBest = "";
+                  sawSnapshot = true;
+                  post({
+                    type: "M365_DELTA",
+                    id,
+                    text: committed,
+                    deltaSource: "type2-final",
+                  });
+                } else {
+                  // No authoritative result.message this turn; fall back to the
+                  // per-messageId text via the (now citation-aware) snapshot path.
+                  const finalText = finalTextFromType2(item);
+                  if (finalText)
+                    publishSnapshot(
+                      finalText,
+                      "type2-final",
+                      activeAnswerMessageId,
+                    );
+                }
+                type2ConversationId = item.conversationId || convId;
+                type2TurnState = String(item.turnState || "");
+                // type=2 is the streamed item result, not the Hub invocation
+                // completion. Keep parsing: captures show type=3 can follow in
+                // the same WebSocket message after the RS separator.
+                if (completionFallbackTimer !== null)
+                  clearTimeout(completionFallbackTimer);
+                completionFallbackTimer = setTimeout(
+                  finishFromType2Fallback,
+                  3000,
+                );
+                continue;
               } else if (f.type === 3) {
                 if (f.error)
                   done({
@@ -673,8 +1315,11 @@
                   done({
                     type: "M365_DONE",
                     id,
-                    text: best,
-                    conversationId: convId,
+                    text: totalText(),
+                    conversationId: type2ConversationId || convId,
+                    completionSignal: "signalr-type-3",
+                    authoritative: true,
+                    turnState: type2TurnState,
                   });
                 return;
               }
@@ -689,12 +1334,8 @@
           else if (d instanceof ArrayBuffer) run(new TextDecoder().decode(d));
         };
 
-        // 兜底超时
-        timeoutTimer = setTimeout(
-          () =>
-            done({ type: "M365_ERROR", id, error: "M365 websocket timeout" }),
-          180000,
-        );
+        // 兜底超时(空闲看门狗:每收到一帧都会在 ws.onmessage 中重置)
+        armIdleTimeout();
       } catch (e) {
         try {
           if (ws) ws.close();
@@ -724,12 +1365,14 @@
       });
       return;
     }
-    post({
-      type: "M365_FRAME_READY",
-      capabilities: hookState.capabilities,
-      frameOrigin: location.origin,
-      frameUrl: location.href,
-    });
+    if (frameMayHostSocket()) {
+      post({
+        type: "M365_FRAME_READY",
+        capabilities: hookState.capabilities,
+        frameOrigin: location.origin,
+        frameUrl: location.href,
+      });
+    }
   }
 
   // Register relays before injection so PAGE_HOOK's immediate READY cannot race past us.

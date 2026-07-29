@@ -292,7 +292,12 @@
         new URL(siteUrl).origin +
         "/_api/v2.1/shares/" +
         shareIdFromUrl(url) +
-        "/driveItem";
+        // $select the pre-authenticated direct-download link alongside the
+        // fields we already validate. "@content.downloadUrl" is a short-lived
+        // (≈1h) credential-less URL that streams the file bytes directly; the
+        // permalink (`url`) stays the stable, login-gated share link. Selecting
+        // it here is the only way to surface it (it is not returned by default).
+        "/driveItem?$select=id,name,size,file,parentReference,content.downloadUrl";
       const item = await spFetch(driveItemUrl, {
         credentials: "omit",
         headers: {
@@ -315,6 +320,9 @@
       uploaded.push({
         name,
         url,
+        // Pre-authenticated direct-download URL (may be "" if the tenant/item
+        // does not expose it); consumers must fall back to `url` when absent.
+        downloadUrl: String(item["@content.downloadUrl"] || ""),
         driveItemUrl,
         itemId: item.id,
         driveId: item.parentReference.driveId,

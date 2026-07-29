@@ -1118,6 +1118,12 @@ const M365_BRIDGE_URL = "ws://127.0.0.1:5002/ws";
 const M365_AUTH_KEY = "voiceEdgeM365AuthV1";
 const M365_SETTINGS_KEY = "voiceEdgeM365SettingsV1";
 const M365_SYDNEY_SCOPE = "https://substrate.office.com/sydney/.default";
+// Audience required by the AMS object endpoint (asyncgw.teams.microsoft.com/
+// v1/objects/…) that serves CodeInterpreter / present_files artifacts. The
+// Sydney token (aud=substrate.office.com/sydney) is REJECTED there with 401 —
+// that was the harvestArtifacts failure. This IC3/Teams scope mints a token
+// whose aud is ic3.teams.office.com, which AMS accepts.
+const M365_IC3_SCOPE = "https://ic3.teams.office.com/.default";
 const M365_TENANT_RE = /login\.microsoftonline\.com\/([0-9a-f-]{36})\/oauth2/i;
 const M365_ENTRY_RE =
   /^https:\/\/outlook\.cloud\.microsoft\/host\/[0-9a-f-]{36}\/entity1-[0-9a-f-]{36}\/?$/i;
@@ -1127,6 +1133,9 @@ let _clientId = "";
 let _tid = "";
 let _m365TokenContext = { version: 1, query: {}, body: {} };
 let _sydney = { token: "", exp: 0 };
+let _ic3 = { token: "", exp: 0 };
+let _ic3Refreshing = null;
+let _ic3Probed = false; // one-time aud/scp probe log (see refreshIc3Token)
 let _sharePoint = { token: "", exp: 0, origin: "" };
 let _sharePointRefreshing = null;
 let m365LastRefreshError = "";
@@ -1140,7 +1149,17 @@ let m365SettingsLoaded = false;
 let m365SettingsLoadPromise = null;
 let m365EntryUrl = "";
 let sharePointHomeUrl = "";
+// Two distinct SharePoint folders, per the user's split:
+//  - sharePointUploadFolder   : "传给模型的目录" — where the user's files that
+//                                are sent TO the model live (user -> model).
+//                                Used by prepareM365Attachments (unchanged).
+//  - sharePointDownloadFolder : "模型传的目录" — where files the MODEL produced
+//                                (CodeInterpreter / present_files artifacts) are
+//                                uploaded (model -> SharePoint) by the artifact
+//                                harvester. Falls back to the upload folder if
+//                                voice_edge has not yet been updated to send it.
 let sharePointUploadFolder = "";
+let sharePointDownloadFolder = "";
 let sharePointLastResult = null;
 let sharePointReadyPageUrl = "";
 const sharePointUploadWaiters = new Map();
@@ -1152,6 +1171,20 @@ const M365_RECONNECT_MAX_MS = 30000;
 let m365TargetFrame = null;
 const m365FrameCandidates = new Map();
 const log = (...args) => console.log("[VE-m365-bg]", ...args);
+// Gated verbose tracing. OFF by default; driven from Python via M365_CONFIG
+// `debug` (so backend M365_DEBUG=1 turns it on end-to-end) and also togglable
+// live from the extension console: __veM365SetDebug(true).
+let m365Debug = false;
+const dlog = (...args) => {
+  if (m365Debug) console.log("[VE-m365-bg][dbg]", ...args);
+};
+try {
+  globalThis.__veM365SetDebug = (on) => {
+    m365Debug = !!on;
+    log("debug tracing", m365Debug ? "ON" : "OFF");
+    return m365Debug;
+  };
+} catch (_) {}
 browser.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.__veSharePoint !== true) return;
 });
@@ -1516,6 +1549,115 @@ async function refreshSydney() {
   }
 }
 
+// Mint a Teams/IC3-audience token for the AMS artifact endpoint. Uses the SAME
+// captured FOCI refresh token as Sydney/SharePoint (same token endpoint, only
+// the scope differs); FOCI lets one family refresh token mint tokens for
+// sibling resources, exactly as refreshSharePointAccessToken does for the
+// SharePoint audience. Cached with a 90s skew like the others.
+async function refreshIc3Token() {
+  await ensureM365AuthLoaded();
+  if (_ic3.token && _ic3.exp - Date.now() > 90000) return _ic3.token;
+  if (_ic3Refreshing) return _ic3Refreshing;
+  if (!_clientId || !_rt || !_tid)
+    throw new Error(
+      "IC3 token unavailable: M365 refresh credentials not captured",
+    );
+  _ic3Refreshing = (async () => {
+    const capturedQuery = _m365TokenContext.query || {};
+    const capturedBody = _m365TokenContext.body || {};
+    const endpoint = new URL(
+      "https://login.microsoftonline.com/" + _tid + "/oauth2/v2.0/token",
+    );
+    for (const [name, value] of Object.entries(capturedQuery)) {
+      if (value != null && value !== "")
+        endpoint.searchParams.set(name, String(value));
+    }
+    endpoint.searchParams.set("client_id", _clientId);
+    endpoint.searchParams.set("client-request-id", crypto.randomUUID());
+    const body = new URLSearchParams();
+    for (const [name, value] of Object.entries(capturedBody)) {
+      if (value != null) body.set(name, String(value));
+    }
+    body.set("client_id", _clientId);
+    body.set("grant_type", "refresh_token");
+    body.set("refresh_token", _rt);
+    body.set("scope", M365_IC3_SCOPE + " openid profile offline_access");
+    const response = await fetch(endpoint.href, {
+      method: "POST",
+      headers: {
+        Accept: "*/*",
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+      },
+      body: body.toString(),
+    });
+    const text = await response.text();
+    let payload = {};
+    try {
+      payload = text ? JSON.parse(text) : {};
+    } catch (_) {
+      payload = { raw: text };
+    }
+    if (!response.ok || !payload.access_token) {
+      const detail = String(
+        payload.error_description ||
+          payload.error ||
+          payload.raw ||
+          response.status,
+      )
+        .replace(/\s+/g, " ")
+        .slice(0, 500);
+      throw new Error(
+        "IC3 token refresh failed (" + response.status + "): " + detail,
+      );
+    }
+    const claims = decodeM365Jwt(payload.access_token);
+    const audience = String(claims.aud || "")
+      .toLowerCase()
+      .replace(/\/$/, "");
+    // Tolerant audience check (mirrors the SharePoint one): accept the resource
+    // URL form or a bare "ic3" app-id/audience.
+    if (!audience.includes("ic3")) {
+      throw new Error(
+        "unexpected IC3 token audience: " + (claims.aud || "missing"),
+      );
+    }
+    if (claims.tid && String(claims.tid).toLowerCase() !== _tid.toLowerCase())
+      throw new Error("IC3 token tenant mismatch");
+    // One-time diagnostic: decode the minted token's audience and scopes so the
+    // AMS-authorization surface can be confirmed at a glance (aud must be
+    // ic3.teams.office.com; scp shows whether AMS needs an object scope beyond
+    // the default Teams set). Logged once per process, only under debug, and
+    // never prints the token itself.
+    if (m365Debug && !_ic3Probed) {
+      _ic3Probed = true;
+      log(
+        "IC3 token probe: aud=%s appid=%s scp=%s",
+        claims.aud || "<none>",
+        claims.appid || claims.azp || "<none>",
+        claims.scp || claims.roles || "<none>",
+      );
+    }
+    if (payload.refresh_token) {
+      _rt = payload.refresh_token;
+      await saveM365Auth();
+    }
+    const jwtExp = Number(claims.exp || 0) * 1000;
+    _ic3 = {
+      token: payload.access_token,
+      exp:
+        jwtExp ||
+        Date.now() +
+          Math.max(0, Number(payload.expires_in || 3600) - 60) * 1000,
+    };
+    return _ic3.token;
+  })();
+  try {
+    return await _ic3Refreshing;
+  } finally {
+    _ic3Refreshing = null;
+  }
+}
+
 async function refreshSharePointAccessToken(siteUrl) {
   await ensureM365AuthLoaded();
   const origin = new URL(String(siteUrl || "")).origin;
@@ -1676,6 +1818,10 @@ function m365Connect() {
       return;
     }
     if (message.type === "M365_CONFIG") {
+      if (typeof message.debug !== "undefined") {
+        m365Debug = !!message.debug;
+        log("debug tracing", m365Debug ? "ON (from M365_CONFIG)" : "OFF");
+      }
       setM365EntryUrl(message.entryUrl).catch((error) =>
         log("invalid M365 config:", compactError(error)),
       );
@@ -1686,9 +1832,25 @@ function m365Connect() {
       sharePointUploadFolder = String(
         message.sharePointUploadFolder || "",
       ).replace(/^\/+|\/+$/g, "");
+      // Second folder for model-produced artifacts. Fall back to the upload
+      // folder when voice_edge has not yet been updated to send the new field,
+      // so the feature degrades to "same folder" rather than breaking.
+      sharePointDownloadFolder = String(
+        message.sharePointDownloadFolder ||
+          message.sharePointUploadFolder ||
+          "",
+      ).replace(/^\/+|\/+$/g, "");
       return;
     }
     if (message.type === "M365_ASK") {
+      dlog(
+        "M365_ASK recv id=%s conversationId=%s tone=%s attachments=%d textLen=%d",
+        String(message.id || ""),
+        String(message.conversationId || "") || "<new>",
+        String(message.tone || ""),
+        Array.isArray(message.attachments) ? message.attachments.length : 0,
+        String(message.text || "").length,
+      );
       if (message.entryUrl) setM365EntryUrl(message.entryUrl).catch(() => {});
       dispatchM365(message);
     }
@@ -1719,17 +1881,73 @@ async function ensureM365Tab() {
   return browser.tabs.create({ url: m365EntryUrl, active: false });
 }
 
+// Stable per-document identity for frame dedup: origin + pathname, with the
+// query string and fragment removed. The M365 host rewrites volatile query
+// params (notably sessionId) on every reload, so the raw frameUrl differs each
+// refresh; the path is stable across refreshes of the same document. Falls back
+// to a query/fragment-trimmed string if URL parsing fails, and finally to the
+// raw value so a non-URL never collapses unrelated frames together.
+function normalizeM365FrameKey(rawUrl) {
+  const value = String(rawUrl || "");
+  if (!value) return "";
+  try {
+    const u = new URL(value);
+    return u.origin + u.pathname;
+  } catch (_) {
+    return value.split(/[?#]/, 1)[0] || value;
+  }
+}
+
 function rememberM365Frame(message, sender, hasChats) {
   if (!sender.tab || sender.tab.id == null || sender.frameId == null)
     return null;
+  const frameUrl = String(message.frameUrl || sender.url || "");
   const frame = {
     tabId: sender.tab.id,
     frameId: sender.frameId,
     frameOrigin: String(message.frameOrigin || ""),
-    frameUrl: String(message.frameUrl || sender.url || ""),
+    frameUrl,
+    // Identity used for dedup: origin + pathname with the query string dropped.
+    // A refresh keeps the same document/path but the host rewrites volatile
+    // query params (observed: sessionId changes on every reload, e.g.
+    // .../semanticoverview/Users(...)?...&sessionId=<new-guid>&...). Comparing
+    // the full frameUrl therefore treated each refresh as a brand-new frame and
+    // the stale entries accumulated one-per-reload (the duplicate
+    // "M365 page hook ready" you saw). Normalizing to path removes the volatile
+    // query so refreshes collapse onto one identity.
+    frameKey: normalizeM365FrameKey(frameUrl),
     hasChats: Boolean(hasChats),
     seenAt: Date.now(),
   };
+  // Evict stale duplicates from the SAME document before registering the new
+  // frame. A page refresh reuses the tab (tabId unchanged) but assigns the
+  // document a brand-new frameId, so the previous frameId entry is a dead
+  // zombie the onRemoved handler never cleans (it only fires on tab CLOSE, not
+  // reload). Left in place, these accumulate one-per-refresh and can be
+  // preferred by the hasChats-first ordering, forcing every dispatch to
+  // try-then-prune a dead frame (added latency) or, worse, letting a mid-reload
+  // zombie ack the relay without ever running doAsk (idle timeout). Keyed by
+  // tabId + normalized frameKey so a query-only change (sessionId) still counts
+  // as the same document and only the newest frameId survives.
+  if (frame.frameKey) {
+    for (const [key, existing] of m365FrameCandidates) {
+      if (
+        existing.tabId === frame.tabId &&
+        (existing.frameKey || normalizeM365FrameKey(existing.frameUrl)) ===
+          frame.frameKey &&
+        existing.frameId !== frame.frameId
+      ) {
+        m365FrameCandidates.delete(key);
+        if (
+          m365TargetFrame &&
+          m365TargetFrame.tabId === existing.tabId &&
+          m365TargetFrame.frameId === existing.frameId
+        ) {
+          m365TargetFrame = null;
+        }
+      }
+    }
+  }
   m365FrameCandidates.set(frame.tabId + ":" + frame.frameId, frame);
   if (
     frame.hasChats ||
@@ -1751,6 +1969,49 @@ function bestM365FrameForTab(tabId) {
       (a, b) => Number(b.hasChats) - Number(a.hasChats) || b.seenAt - a.seenAt,
     );
   return candidates[0] || null;
+}
+
+// Ordered list of every candidate frame for a tab, best-first, with the
+// sticky target promoted to the front. When a page hosts more than one frame
+// that injected the page hook (observed as duplicate "M365 page hook ready"),
+// exactly one of them owns a live self-built Chathub socket; the others are
+// stale/duplicate entries whose frameId no longer routes. dispatchM365 walks
+// this list and confirms delivery by the relay ack, so a stale frameId is
+// skipped instead of silently swallowing the ASK (the "0 inbound events →
+// first-event timeout" failure).
+function orderedM365FramesForTab(tabId) {
+  const seen = new Set();
+  const ordered = [];
+  const push = (frame) => {
+    if (!frame || frame.tabId !== tabId) return;
+    const key = frame.tabId + ":" + frame.frameId;
+    if (seen.has(key)) return;
+    seen.add(key);
+    ordered.push(frame);
+  };
+  push(m365TargetFrame);
+  Array.from(m365FrameCandidates.values())
+    .filter((frame) => frame.tabId === tabId)
+    .sort(
+      (a, b) => Number(b.hasChats) - Number(a.hasChats) || b.seenAt - a.seenAt,
+    )
+    .forEach(push);
+  return ordered;
+}
+
+// Drop a candidate frame whose frameId no longer accepts messages, so a stale
+// duplicate cannot be re-selected on the next turn. Also clears the sticky
+// target if it pointed at the pruned frame.
+function pruneStaleM365Frame(frame) {
+  if (!frame) return;
+  m365FrameCandidates.delete(frame.tabId + ":" + frame.frameId);
+  if (
+    m365TargetFrame &&
+    m365TargetFrame.tabId === frame.tabId &&
+    m365TargetFrame.frameId === frame.frameId
+  ) {
+    m365TargetFrame = null;
+  }
 }
 
 async function waitForM365Hook(tabId, timeoutMs = 15000) {
@@ -1822,21 +2083,238 @@ async function prepareM365Attachments(message) {
   return uploaded;
 }
 
+// Reverse direction of prepareM365Attachments: upload files the MODEL produced
+// (already fetched to base64 by content-m365's artifact harvester) into the
+// SharePoint DOWNLOAD folder. Reuses the exact same, proven SP_UPLOAD_FILES +
+// sharePointUploadWaiters + SP_UPLOAD_COMPLETE machinery as the forward path;
+// the only differences are the folder (sharePointDownloadFolder) and that the
+// bytes come from the harvester rather than an outbound attachment. sp.js is
+// direction-agnostic (it takes uploadFolder as a parameter), so no change is
+// needed there. Returns the uploaded file descriptors (name/url/itemId/…).
+async function uploadArtifactsToSharePoint(files) {
+  const raw = Array.isArray(files) ? files : [];
+  if (!raw.length) return [];
+  if (!sharePointHomeUrl)
+    throw new Error("SHAREPOINT_HOME_URL 未配置，无法上传模型产物");
+  const sharePointAccessToken =
+    await refreshSharePointAccessToken(sharePointHomeUrl);
+  const tab = await ensureSharePointTab();
+  const uploadRequestId = "artifact:" + Date.now() + ":" + crypto.randomUUID();
+  const completion = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      sharePointUploadWaiters.delete(uploadRequestId);
+      reject(new Error("SharePoint artifact upload completion timed out"));
+    }, 60000);
+    sharePointUploadWaiters.set(uploadRequestId, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+    });
+  });
+  browser.tabs
+    .sendMessage(tab.id, {
+      __veSharePoint: true,
+      type: "SP_UPLOAD_FILES",
+      requestId: uploadRequestId,
+      siteUrl: sharePointHomeUrl,
+      // The one meaningful difference from the forward path: the model's
+      // artifacts land in the download folder, not the upload folder.
+      uploadFolder: sharePointDownloadFolder || sharePointUploadFolder,
+      files: raw,
+      sharePointAccessToken,
+    })
+    .then((ack) => {})
+    .catch((error) => {
+      const waiter = sharePointUploadWaiters.get(uploadRequestId);
+      if (waiter) {
+        sharePointUploadWaiters.delete(uploadRequestId);
+        waiter.resolve({ ok: false, error: compactError(error) });
+      }
+    });
+  const response = await completion;
+  sharePointUploadWaiters.delete(uploadRequestId);
+  if (!response || !response.ok)
+    throw new Error(
+      String(
+        (response && response.error) || "SharePoint artifact upload failed",
+      ),
+    );
+  return Array.isArray(response.files) ? response.files : [];
+}
+
+// ---- Model-artifact → SharePoint link injection ---------------------------
+// A turn that produces artifacts (present_files / CodeInterpreter output)
+// uploads them to the SharePoint download folder. To surface the resulting
+// links INSIDE the same answer, we hold this turn's terminal M365_DONE for a
+// bounded window until its uploads settle, then append a link block to
+// DONE.text. Python then emits that appended tail as one final delta via its
+// existing terminal-snapshot path, so neither Python nor the streaming path
+// change. Turns with artifactCount==0 skip all of this (a strict no-op), and
+// the whole feature is one flag away from being disabled.
+const M365_INJECT_ARTIFACT_LINKS = true; // flip to false to fully disable
+const M365_ARTIFACT_LINK_TIMEOUT_MS = 20000; // ceiling on how long DONE is held
+const m365ArtifactTurns = new Map(); // request id -> per-turn injection state
+
+function m365ArtifactTurn(id) {
+  let state = m365ArtifactTurns.get(id);
+  if (!state) {
+    state = {
+      expected: null, // artifactCount from DONE; null until DONE seen
+      settled: 0, // uploads/errors resolved for this id so far
+      descriptors: [], // successful SharePoint descriptors (name/url/downloadUrl)
+      doneMessage: null, // the held terminal payload
+      timer: null,
+      finalized: false,
+    };
+    m365ArtifactTurns.set(id, state);
+  }
+  return state;
+}
+
+// Forward a relayable frame (delta / terminal / snapshot) to Python unchanged.
+// Extracted so the immediate path and the delayed artifact-link path emit the
+// exact same wire shape.
+function m365ForwardToPy(message) {
+  sendM365({
+    type: message.type,
+    id: message.id,
+    text: message.text,
+    conversationId: message.conversationId,
+    chats: message.chats,
+    capturedAt: message.capturedAt,
+    error: message.error,
+    completionSignal: message.completionSignal,
+    authoritative: message.authoritative === true,
+    turnState: message.turnState,
+    deltaSource: message.deltaSource,
+  });
+}
+
+function m365FinalizeArtifactTurn(id, reason) {
+  const state = m365ArtifactTurns.get(id);
+  if (!state || state.finalized || !state.doneMessage) return;
+  state.finalized = true;
+  if (state.timer !== null) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  m365ArtifactTurns.delete(id);
+  const done = state.doneMessage;
+  const links = state.descriptors
+    .map((d) => {
+      const name = String((d && d.name) || "").trim();
+      const dl = d && d.downloadUrl ? "[下载链接](" + d.downloadUrl + ")" : "";
+      const pl = d && d.url ? "[永久链接](" + d.url + ")" : "";
+      const parts = [dl, pl].filter(Boolean).join(", ");
+      if (!parts) return "";
+      return name ? "- " + name + "：" + parts : "- " + parts;
+    })
+    .filter(Boolean);
+  if (links.length && typeof done.text === "string") {
+    // Append-only so the streamed answer stays a strict prefix of DONE.text;
+    // Python then streams exactly this block as the final delta.
+    done.text = done.text + "\n\n已上传到 SharePoint：\n" + links.join("\n");
+  }
+  dlog(
+    "artifact-link finalize id=%s reason=%s links=%d settled=%d/%s",
+    id,
+    reason,
+    links.length,
+    state.settled,
+    String(state.expected),
+  );
+  m365ForwardToPy(done);
+}
+
+function m365MaybeFinalizeArtifactTurn(id) {
+  const state = m365ArtifactTurns.get(id);
+  if (!state || state.finalized || !state.doneMessage) return;
+  if (state.expected !== null && state.settled >= state.expected) {
+    m365FinalizeArtifactTurn(id, "complete");
+  }
+}
+
 async function dispatchM365(message) {
+  // Liveness ack: tell Python we accepted the request the instant it arrives,
+  // before any slow browser-side preparation (tab cold-start, SharePoint
+  // attachment upload, hook wait). None of that produces a Chathub frame, so
+  // without an early signal a slow prep is counted as dead air against the
+  // Python first-event timeout and surfaces as a misleading timeout while any
+  // real error that follows is dropped. A single empty-text M365_PROGRESS flips
+  // got_any=true on the Python side (liveness only; never written to the answer).
+  const keepAlive = () =>
+    sendM365({ type: "M365_PROGRESS", id: message.id, text: "" });
+  keepAlive();
   try {
     const attachments = await prepareM365Attachments(message);
+    keepAlive(); // attachments prepared/uploaded
     const outbound = { ...message, attachments };
     const tab = await ensureM365Tab();
-    const candidates = Array.from(m365FrameCandidates.values()).filter(
-      (frame) => frame.tabId === tab.id,
-    );
-    const target =
-      bestM365FrameForTab(tab.id) || (await waitForM365Hook(tab.id));
-    const ack = await browser.tabs.sendMessage(
-      tab.id,
-      { __veM365ToPage: true, payload: outbound },
-      { frameId: target.frameId },
-    );
+    keepAlive(); // tab resolved (may have just been created and is cold-loading)
+
+    // Ensure at least one hook is ready, then try every candidate frame in
+    // priority order. The relay content script answers with {ok:true,
+    // relayed:true,...}; a stale/duplicate frameId instead rejects or returns
+    // no ack. Confirming the ack is what makes routing robust to the
+    // duplicate-hook hazard: the ASK is delivered to the frame that actually
+    // runs doAsk, rather than being silently swallowed by a dead frameId.
+    if (!bestM365FrameForTab(tab.id)) await waitForM365Hook(tab.id);
+    let frames = orderedM365FramesForTab(tab.id);
+    if (!frames.length) {
+      await waitForM365Hook(tab.id);
+      frames = orderedM365FramesForTab(tab.id);
+    }
+
+    let delivered = false;
+    let lastError = null;
+    for (const target of frames) {
+      try {
+        const ack = await browser.tabs.sendMessage(
+          tab.id,
+          { __veM365ToPage: true, payload: outbound },
+          { frameId: target.frameId },
+        );
+        if (ack && ack.relayed === true) {
+          m365TargetFrame = target; // make the proven-live frame sticky
+          delivered = true;
+          dlog(
+            "dispatch delivered id=%s frameId=%s frameUrl=%s",
+            String(message.id || ""),
+            target.frameId,
+            target.frameUrl,
+          );
+          break;
+        }
+        // A frame with the hook but no relay ack is not usable for this ASK.
+        lastError = new Error("M365 frame did not acknowledge ASK relay");
+        dlog(
+          "dispatch no-ack, pruning frameId=%s id=%s",
+          target.frameId,
+          String(message.id || ""),
+        );
+        pruneStaleM365Frame(target);
+      } catch (sendError) {
+        // frameId no longer exists / no receiver: prune and try the next one.
+        lastError = sendError;
+        dlog(
+          "dispatch send failed, pruning frameId=%s id=%s err=%s",
+          target.frameId,
+          String(message.id || ""),
+          compactError(sendError),
+        );
+        pruneStaleM365Frame(target);
+      }
+    }
+
+    if (!delivered) {
+      throw (
+        lastError ||
+        new Error(
+          "No M365 frame accepted the ASK; reload the configured M365 entry page",
+        )
+      );
+    }
   } catch (error) {
     sendM365({
       type: "M365_ERROR",
@@ -1859,6 +2337,12 @@ browser.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.__veM365 !== true) return;
   return (async () => {
     if (message.type === "M365_FRAME_READY") {
+      console.log(
+        "VE-FRAME-READY",
+        message.frameUrl,
+        message.frameOrigin,
+        sender.frameId,
+      );
       const caps = message.capabilities || {};
       if (
         caps.messageListener !== true ||
@@ -1910,23 +2394,190 @@ browser.runtime.onMessage.addListener((message, sender) => {
       }
       return;
     }
+    if (message.type === "M365_NEED_AMS_TOKEN") {
+      // IC3-audience token for artifact (AMS) downloads; see refreshIc3Token.
+      try {
+        const token = await refreshIc3Token();
+        sendToM365Frame(sender, {
+          type: "M365_AMS_TOKEN",
+          token,
+          exp: _ic3.exp,
+        });
+      } catch (error) {
+        dlog("IC3 token acquisition failed:", compactError(error));
+        sendToM365Frame(sender, {
+          type: "M365_AMS_TOKEN",
+          token: "",
+          error: compactError(error),
+        });
+      }
+      return;
+    }
     if (message.type === "M365_CHATS_SNAPSHOT") {
       rememberM365Frame(message, sender, true);
+    }
+    // Model-produced artifact fetched by content-m365's harvester. Upload it to
+    // the SharePoint download folder. Deliberately NOT forwarded to Python (it
+    // is not in the sendM365 whitelist below), so it never touches the answer
+    // stream. Each artifact arrives as its own message; upload independently
+    // (sp.js uses overwrite=true, so this is idempotent).
+    if (message.type === "M365_ARTIFACT") {
+      const id = String(message.id || "");
+      const track = M365_INJECT_ARTIFACT_LINKS && id;
+      const file = {
+        name: String(message.name || ""),
+        data: String(message.data || ""),
+        size: Number(message.size || 0),
+        mimeType: String(message.mimeType || "application/octet-stream"),
+      };
+      if (file.name && file.data) {
+        // Always resolves (never rejects) to a descriptor array, so the
+        // settled-counter below advances on both success and failure.
+        const uploadPromise = uploadArtifactsToSharePoint([file])
+          .then((uploaded) => {
+            const list = Array.isArray(uploaded) ? uploaded : [];
+            const info = list[0] || {};
+            log(
+              "M365 artifact uploaded to SharePoint:",
+              file.name,
+              info.url || info.serverRelativeUrl || "(no url)",
+            );
+            return list;
+          })
+          .catch((error) => {
+            log("M365 artifact upload failed:", file.name, compactError(error));
+            return [];
+          });
+        if (track) {
+          const state = m365ArtifactTurn(id);
+          uploadPromise
+            .then((uploaded) => {
+              for (const d of uploaded) if (d) state.descriptors.push(d);
+            })
+            .finally(() => {
+              state.settled += 1;
+              m365MaybeFinalizeArtifactTurn(id);
+            });
+        }
+      } else if (track) {
+        // Malformed artifact (no name/bytes): still count it as settled so a
+        // held DONE can release once every expected artifact is accounted for.
+        const state = m365ArtifactTurn(id);
+        state.settled += 1;
+        m365MaybeFinalizeArtifactTurn(id);
+      }
+      return;
+    }
+    if (message.type === "M365_ARTIFACT_ERROR") {
+      log(
+        "M365 artifact fetch failed:",
+        String(message.url || ""),
+        String(message.error || ""),
+      );
+      // A failed fetch still resolves one of this turn's expected artifacts, so
+      // counting it lets a held DONE finalize early (with whatever links did
+      // succeed) instead of always waiting out the timeout.
+      const id = String(message.id || "");
+      if (M365_INJECT_ARTIFACT_LINKS && id) {
+        const state = m365ArtifactTurn(id);
+        state.settled += 1;
+        m365MaybeFinalizeArtifactTurn(id);
+      }
+      return;
+    }
+    // --- Reasoning / progress liveness bridge --------------------------------
+    // During a long "thinking" phase the model streams ONLY chain-of-thought /
+    // progress frames — no answer tokens.
+    // content-m365 emits these as M365_PROGRESS (plus
+    // M365_REASONING for genuine CoT) explicitly "for the Python relay", but they
+    // were never forwarded here. The extension's own idle watchdog resets on
+    // every socket frame and DELIBERATELY delegates the content-based idle
+    // timeout to the Python relay — yet the relay only ever saw M365_DELTA, so
+    // during the reasoning phase it received nothing, tripped its content-idle
+    // timeout, and tore down the SSE to Continue BEFORE the answer body began.
+    // The entire reply was lost. Forward these
+    // frames so the relay's liveness/idle timer keeps resetting until the first
+    // answer delta arrives.
+    //
+    // M365_PROGRESS is forwarded as a PURE liveness ping (empty text) — the exact
+    // contract the relay already relies on (see dispatchM365's keepAlive): it
+    // flips got_any / resets the idle timer and is NEVER written to the answer,
+    // so the append-only answer stream is byte-for-byte untouched. M365_REASONING
+    // additionally carries the cumulative CoT text on its own dedicated channel
+    // (append-only per content-m365), keeping any surfaced reasoning off the
+    // answer path. The liveness ping alone fixes the loss even if the relay
+    // ignores M365_REASONING.
+    if (message.type === "M365_PROGRESS") {
+      sendM365({ type: "M365_PROGRESS", id: message.id, text: "" });
+      return;
+    }
+    if (message.type === "M365_REASONING") {
+      sendM365({ type: "M365_PROGRESS", id: message.id, text: "" });
+      sendM365({
+        type: "M365_REASONING",
+        id: message.id,
+        text: message.text,
+        messageId: message.messageId,
+      });
+      return;
     }
     if (
       ["M365_DELTA", "M365_DONE", "M365_ERROR", "M365_CHATS_SNAPSHOT"].includes(
         message.type,
       )
     ) {
-      sendM365({
-        type: message.type,
-        id: message.id,
-        text: message.text,
-        conversationId: message.conversationId,
-        chats: message.chats,
-        capturedAt: message.capturedAt,
-        error: message.error,
-      });
+      if (message.type === "M365_DONE" || message.type === "M365_ERROR") {
+        dlog(
+          "relay->py %s id=%s conversationId=%s signal=%s authoritative=%s turnState=%s textLen=%d%s",
+          message.type,
+          String(message.id || ""),
+          String(message.conversationId || "") || "<none>",
+          String(message.completionSignal || ""),
+          message.authoritative === true,
+          String(message.turnState || ""),
+          String(message.text || "").length,
+          message.error ? " error=" + String(message.error) : "",
+        );
+      }
+      // Hold the terminal ONLY when this turn produced artifacts and injection
+      // is on; deltas, snapshots, errors, and artifact-free DONEs forward
+      // immediately, so the streaming path is byte-for-byte unchanged.
+      if (
+        message.type === "M365_DONE" &&
+        M365_INJECT_ARTIFACT_LINKS &&
+        sharePointHomeUrl &&
+        Number(message.artifactCount || 0) > 0 &&
+        String(message.id || "")
+      ) {
+        const id = String(message.id);
+        const state = m365ArtifactTurn(id);
+        state.expected = Number(message.artifactCount) || 0;
+        state.doneMessage = message;
+        // Safety net: never hold the answer open indefinitely. If uploads are
+        // slow or an expected artifact never reports, release with whatever
+        // links succeeded (possibly none).
+        state.timer = setTimeout(
+          () => m365FinalizeArtifactTurn(id, "timeout"),
+          M365_ARTIFACT_LINK_TIMEOUT_MS,
+        );
+        // Artifacts (and their uploads) may already have settled before this
+        // DONE arrived, in which case finalize right away.
+        m365MaybeFinalizeArtifactTurn(id);
+        return;
+      }
+      // Any terminal we forward WITHOUT holding (an error, or a DONE we chose
+      // not to hold, e.g. SharePoint unconfigured) may have created artifact-
+      // turn state from early M365_ARTIFACT frames. Drop it so the map cannot
+      // leak. (Held DONEs return above and clean up in finalize.)
+      if (message.type === "M365_DONE" || message.type === "M365_ERROR") {
+        const id = String(message.id || "");
+        const state = id && m365ArtifactTurns.get(id);
+        if (state) {
+          if (state.timer !== null) clearTimeout(state.timer);
+          m365ArtifactTurns.delete(id);
+        }
+      }
+      m365ForwardToPy(message);
     }
   })();
 });
