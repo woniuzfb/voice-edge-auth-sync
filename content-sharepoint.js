@@ -64,8 +64,74 @@
     return readJson(response);
   }
 
+  // SharePoint Online returns transient 503 (and occasionally 429/500/502/504)
+  // under concurrent multi-file load — an HTML throttling page, not a durable
+  // failure. Retry those, and bare network faults, with exponential backoff +
+  // jitter, honoring Retry-After when present. Every retried request in the
+  // upload path is idempotent (contextinfo POST; addUsingPath uses
+  // overwrite=true; the read-backs are GETs), so replay is safe. 4xx other
+  // than 429 (auth, not-found, bad request) is NOT retried — it will not fix
+  // itself and must surface immediately.
+  const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  function backoffDelay(base, attempt) {
+    return base * 2 ** attempt + Math.floor(Math.random() * 300);
+  }
+
+  async function fetchRetry(url, options = {}, retry = {}) {
+    const attempts = Math.max(1, Number(retry.attempts) || 5);
+    const baseDelay = Math.max(1, Number(retry.baseDelay) || 600);
+    let lastError = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      let response;
+      try {
+        response = await fetch(url, options);
+      } catch (networkError) {
+        // DNS/reset/offline: retry unless this was the final attempt.
+        lastError = networkError;
+        if (attempt < attempts - 1) {
+          await sleep(backoffDelay(baseDelay, attempt));
+          continue;
+        }
+        throw networkError;
+      }
+      if (RETRYABLE_STATUS.has(response.status) && attempt < attempts - 1) {
+        const retryAfter = Number(response.headers.get("Retry-After"));
+        const wait =
+          Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : backoffDelay(baseDelay, attempt);
+        // Drain the throttling-page body so the connection can be reused.
+        try {
+          await response.arrayBuffer();
+        } catch (_) {}
+        await sleep(wait);
+        continue;
+      }
+      return response;
+    }
+    throw lastError || new Error("SharePoint request failed after retries");
+  }
+
+  async function spFetchRetry(url, options = {}, retry = {}) {
+    const response = await fetchRetry(
+      url,
+      {
+        credentials: "include",
+        cache: "no-store",
+        ...options,
+        headers: {
+          Accept: "application/json;odata=nometadata",
+          ...(options.headers || {}),
+        },
+      },
+      retry,
+    );
+    return readJson(response);
+  }
+
   async function getDigest(siteUrl) {
-    const data = await spFetch(siteUrl + "/_api/contextinfo", {
+    const data = await spFetchRetry(siteUrl + "/_api/contextinfo", {
       method: "POST",
     });
     const info =
@@ -111,7 +177,7 @@
         encodeURIComponent(odataString(candidate)) +
         "')?$select=ServerRelativeUrl,Exists";
       try {
-        const data = await spFetch(endpoint);
+        const data = await spFetchRetry(endpoint);
         const value = data?.d || data;
         if (value.Exists !== false && value.ServerRelativeUrl)
           return String(value.ServerRelativeUrl).replace(/\/$/, "");
@@ -187,7 +253,7 @@
       "/_api/web/GetFolderByServerRelativePath(decodedurl='" +
       encodeURIComponent(odataString(folderPath)) +
       "')?$select=ServerRelativeUrl,Exists";
-    const data = await spFetch(endpoint);
+    const data = await spFetchRetry(endpoint);
     const value = data?.d || data;
     if (value.Exists === false || !value.ServerRelativeUrl)
       throw new Error("SharePoint upload folder does not exist: " + folderPath);
@@ -205,7 +271,7 @@
       "/_api/web/GetFileByServerRelativePath(decodedurl='" +
       encodeURIComponent(odataString(serverRelativeUrl)) +
       "')/$value";
-    const response = await fetch(endpoint, {
+    const response = await fetchRetry(endpoint, {
       credentials: "include",
       cache: "no-store",
       headers: { Accept: "application/octet-stream" },
@@ -234,107 +300,134 @@
       : libraryRoot;
     await ensureFolder(siteUrl, folderPath);
     const uploaded = [];
+    // One file's hard failure (post-retry) must not abort the whole batch:
+    // a single unrecoverable attachment used to throw here and lose every
+    // other file's upload. Collect per-file failures instead and let the
+    // caller decide. Transient 503/429/etc. are already absorbed by
+    // spFetchRetry/fetchRetry below, so `failed` only ever holds genuinely
+    // unrecoverable files.
+    const failed = [];
     for (const raw of list) {
+      // SharePoint 文件名非法字符： \ / : * ? " < > | 以及首尾点/空白。
+      // 上游 content-m365.js 现已解码 encoded-word 并清洗，这里保留同一套
+      // 清洗作为兜底：任何漏网的坏名字都不会再把 addUsingPath 打挂。
       const name = String(raw?.name || "")
-        .replace(/[\\/]/g, "_")
+        .replace(/[\\/:*?"<>|]/g, "_")
+        .replace(/^\.+|\.+$/g, "")
         .trim();
-      if (!name) throw new Error("M365 attachment filename is empty");
-      const bytes = decodeBase64(raw.data);
-      const expected = Number(raw.size || bytes.byteLength);
-      if (bytes.byteLength !== expected)
-        throw new Error("M365 attachment size mismatch: " + name);
-      const endpoint =
-        siteUrl +
-        "/_api/web/GetFolderByServerRelativePath(decodedurl='" +
-        encodeURIComponent(odataString(folderPath)) +
-        "')/Files/addUsingPath(decodedurl='" +
-        encodeURIComponent(odataString(name)) +
-        "',overwrite=true)";
-      const data = await spFetch(endpoint, {
-        method: "POST",
-        body: bytes,
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-RequestDigest": digest.value,
-        },
-      });
-      const value = data?.d || data;
-      const serverRelativeUrl = String(
-        value.ServerRelativeUrl || folderPath + "/" + name,
-      );
-      const url = fileUrlFromServerRelative(siteUrl, serverRelativeUrl);
-      const expectedSha256 = await sha256Hex(bytes);
-      const downloaded = await readFileBytes(siteUrl, serverRelativeUrl);
-      const actualSha256 = await sha256Hex(downloaded);
-      if (
-        downloaded.byteLength !== bytes.byteLength ||
-        actualSha256 !== expectedSha256
-      ) {
-        throw new Error(
-          "SharePoint read-back verification failed for " +
-            name +
-            ": expected " +
-            bytes.byteLength +
-            "/" +
-            expectedSha256 +
-            ", got " +
-            downloaded.byteLength +
-            "/" +
-            actualSha256,
+      try {
+        if (!name) throw new Error("M365 attachment filename is empty");
+        const bytes = decodeBase64(raw.data);
+        const expected = Number(raw.size || bytes.byteLength);
+        if (bytes.byteLength !== expected)
+          throw new Error("M365 attachment size mismatch: " + name);
+        const endpoint =
+          siteUrl +
+          "/_api/web/GetFolderByServerRelativePath(decodedurl='" +
+          encodeURIComponent(odataString(folderPath)) +
+          "')/Files/addUsingPath(decodedurl='" +
+          encodeURIComponent(odataString(name)) +
+          "',overwrite=true)";
+        const data = await spFetchRetry(endpoint, {
+          method: "POST",
+          body: bytes,
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-RequestDigest": digest.value,
+          },
+        });
+        const value = data?.d || data;
+        const serverRelativeUrl = String(
+          value.ServerRelativeUrl || folderPath + "/" + name,
         );
+        const url = fileUrlFromServerRelative(siteUrl, serverRelativeUrl);
+        const expectedSha256 = await sha256Hex(bytes);
+        const downloaded = await readFileBytes(siteUrl, serverRelativeUrl);
+        const actualSha256 = await sha256Hex(downloaded);
+        if (
+          downloaded.byteLength !== bytes.byteLength ||
+          actualSha256 !== expectedSha256
+        ) {
+          throw new Error(
+            "SharePoint read-back verification failed for " +
+              name +
+              ": expected " +
+              bytes.byteLength +
+              "/" +
+              expectedSha256 +
+              ", got " +
+              downloaded.byteLength +
+              "/" +
+              actualSha256,
+          );
+        }
+        const bearer = String(sharePointAccessToken || "").trim();
+        if (!/^Bearer\s+/i.test(bearer))
+          throw new Error(
+            "SharePoint bearer token is unavailable for richtext URL resolution",
+          );
+        const driveItemUrl =
+          new URL(siteUrl).origin +
+          "/_api/v2.1/shares/" +
+          shareIdFromUrl(url) +
+          // $select the pre-authenticated direct-download link alongside the
+          // fields we already validate. "@content.downloadUrl" is a short-lived
+          // (≈1h) credential-less URL that streams the file bytes directly; the
+          // permalink (`url`) stays the stable, login-gated share link. Selecting
+          // it here is the only way to surface it (it is not returned by default).
+          "/driveItem?$select=id,name,size,file,parentReference,content.downloadUrl";
+        const item = await spFetchRetry(driveItemUrl, {
+          credentials: "omit",
+          headers: {
+            Accept: "application/json",
+            Authorization: bearer,
+            Prefer: "respond-async",
+            Scenario:
+              "richtexturlresolution.prefetch.getdocumentsummary.searchsuggestions",
+            "Client-Request-Id": crypto.randomUUID(),
+          },
+        });
+        if (
+          !item?.id ||
+          String(item.name || "") !== name ||
+          !item?.parentReference?.driveId
+        )
+          throw new Error("SharePoint driveItem validation failed for " + name);
+        if (
+          Number(item.size || downloaded.byteLength) !== downloaded.byteLength
+        )
+          throw new Error("SharePoint driveItem size mismatch for " + name);
+        uploaded.push({
+          name,
+          url,
+          // Pre-authenticated direct-download URL (may be "" if the tenant/item
+          // does not expose it); consumers must fall back to `url` when absent.
+          downloadUrl: String(item["@content.downloadUrl"] || ""),
+          driveItemUrl,
+          itemId: item.id,
+          driveId: item.parentReference.driveId,
+          size: downloaded.byteLength,
+          sha256: actualSha256,
+          verified: true,
+          mimeType:
+            item.file?.mimeType ||
+            String(raw.mimeType || "application/octet-stream"),
+        });
+      } catch (error) {
+        failed.push({
+          name: name || "(unnamed)",
+          error: String((error && error.message) || error)
+            .replace(/\s+/g, " ")
+            .slice(0, 500),
+        });
       }
-      const bearer = String(sharePointAccessToken || "").trim();
-      if (!/^Bearer\s+/i.test(bearer))
-        throw new Error(
-          "SharePoint bearer token is unavailable for richtext URL resolution",
-        );
-      const driveItemUrl =
-        new URL(siteUrl).origin +
-        "/_api/v2.1/shares/" +
-        shareIdFromUrl(url) +
-        // $select the pre-authenticated direct-download link alongside the
-        // fields we already validate. "@content.downloadUrl" is a short-lived
-        // (≈1h) credential-less URL that streams the file bytes directly; the
-        // permalink (`url`) stays the stable, login-gated share link. Selecting
-        // it here is the only way to surface it (it is not returned by default).
-        "/driveItem?$select=id,name,size,file,parentReference,content.downloadUrl";
-      const item = await spFetch(driveItemUrl, {
-        credentials: "omit",
-        headers: {
-          Accept: "application/json",
-          Authorization: bearer,
-          Prefer: "respond-async",
-          Scenario:
-            "richtexturlresolution.prefetch.getdocumentsummary.searchsuggestions",
-          "Client-Request-Id": crypto.randomUUID(),
-        },
-      });
-      if (
-        !item?.id ||
-        String(item.name || "") !== name ||
-        !item?.parentReference?.driveId
-      )
-        throw new Error("SharePoint driveItem validation failed for " + name);
-      if (Number(item.size || downloaded.byteLength) !== downloaded.byteLength)
-        throw new Error("SharePoint driveItem size mismatch for " + name);
-      uploaded.push({
-        name,
-        url,
-        // Pre-authenticated direct-download URL (may be "" if the tenant/item
-        // does not expose it); consumers must fall back to `url` when absent.
-        downloadUrl: String(item["@content.downloadUrl"] || ""),
-        driveItemUrl,
-        itemId: item.id,
-        driveId: item.parentReference.driveId,
-        size: downloaded.byteLength,
-        sha256: actualSha256,
-        verified: true,
-        mimeType:
-          item.file?.mimeType ||
-          String(raw.mimeType || "application/octet-stream"),
-      });
     }
-    return { ok: true, folder: relativeFolder, files: uploaded };
+    // ok stays true as long as at least one file uploaded (or the batch was
+    // empty). The caller inspects `failed` to surface partial losses; only a
+    // total wipeout (every file failed) reports ok:false so the forward path
+    // can raise instead of sending a turn with zero attachments.
+    const ok = uploaded.length > 0 || list.length === 0;
+    return { ok, folder: relativeFolder, files: uploaded, failed };
   }
   browser.runtime.onMessage.addListener((message) => {
     if (!message || message.__veSharePoint !== true) return;

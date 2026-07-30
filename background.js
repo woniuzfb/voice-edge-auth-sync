@@ -2029,6 +2029,30 @@ async function waitForM365Hook(tabId, timeoutMs = 15000) {
 async function prepareM365Attachments(message) {
   const raw = Array.isArray(message.attachments) ? message.attachments : [];
   if (!raw.length) return [];
+  // Split by kind BEFORE touching SharePoint. Images must be ingested inline
+  // (content-m365.js -> owahub UploadFile -> docId -> ImageFile annotation) so
+  // the vision model receives the actual pixels. Routing them through
+  // SharePoint produces a FileUrl document link instead, which is exactly the
+  // "pasted image arrives as a file/text link" bug. Only genuine file
+  // attachments use the SharePoint upload / FileUrl path.
+  const imageItems = [];
+  const fileItems = [];
+  for (const item of raw) {
+    if (item && item.kind === "image") imageItems.push(item);
+    else fileItems.push(item);
+  }
+  // Pass images through untouched, normalized to the field names
+  // content-m365.js expects (kind + dataBase64). Python sends the base64 in
+  // `data`; the extension's uploadImageToM365 reads `dataBase64`.
+  const passthroughImages = imageItems.map((img) => ({
+    kind: "image",
+    name: String(img.name || ""),
+    mimeType: String(img.mimeType || "application/octet-stream"),
+    dataBase64: String(img.dataBase64 || img.data || ""),
+  }));
+  // No document attachments → skip SharePoint entirely (and its config check).
+  // A turn with only pasted images must not require SHAREPOINT_HOME_URL.
+  if (!fileItems.length) return passthroughImages;
   if (!sharePointHomeUrl)
     throw new Error("SHAREPOINT_HOME_URL 未配置，无法上传 M365 附件");
   const sharePointAccessToken =
@@ -2040,7 +2064,7 @@ async function prepareM365Attachments(message) {
     const timer = setTimeout(() => {
       sharePointUploadWaiters.delete(uploadRequestId);
       reject(new Error("SharePoint upload completion event timed out"));
-    }, 60000);
+    }, sharePointUploadTimeoutMs(fileItems.length));
     sharePointUploadWaiters.set(uploadRequestId, {
       resolve: (value) => {
         clearTimeout(timer);
@@ -2059,7 +2083,7 @@ async function prepareM365Attachments(message) {
       requestId: uploadRequestId,
       siteUrl: sharePointHomeUrl,
       uploadFolder: sharePointUploadFolder,
-      files: raw,
+      files: fileItems,
       sharePointAccessToken,
     })
     .then((ack) => {})
@@ -2080,7 +2104,41 @@ async function prepareM365Attachments(message) {
     );
   }
   const uploaded = Array.isArray(response.files) ? response.files : [];
-  return uploaded;
+  // sp.js now returns partial batches: at least one file uploaded (ok:true)
+  // while others may have hard-failed post-retry. Do not silently drop those —
+  // surface them so a subtly incomplete turn (model never sees an attachment
+  // the user added) is visible rather than mysterious.
+  const failed = Array.isArray(response.failed) ? response.failed : [];
+  if (failed.length) {
+    log(
+      "SharePoint attachment upload partial: %d ok, %d failed [%s]",
+      uploaded.length,
+      failed.length,
+      failed
+        .map(
+          (f) =>
+            String((f && f.name) || "?") + ": " + String((f && f.error) || ""),
+        )
+        .join("; "),
+    );
+  }
+  // Uploaded document attachments (FileUrl path) + inline images (ImageFile
+  // path). Both kinds flow to content-m365.js: files satisfy the FileUrl
+  // filter (url/itemId/driveId/verified), images carry kind+dataBase64 so
+  // doAsk uploads them for a docId and buildChatArgs emits an ImageFile.
+  return [...uploaded, ...passthroughImages];
+}
+
+// Bounded per-file scaling for the SharePoint completion wait. Each file now
+// costs an addUsingPath + read-back GET + driveItem GET, and every one of
+// those can burn several exponential-backoff retries against a throttling
+// (503) tenant. A flat 60s aborted large or throttled batches mid-flight and
+// surfaced as a misleading "completion event timed out" while uploads were
+// still succeeding. Floor 60s (unchanged for the common 1-file case), +30s per
+// file, capped at 5min so a stuck batch still fails in bounded time.
+function sharePointUploadTimeoutMs(fileCount) {
+  const count = Math.max(1, Number(fileCount) || 1);
+  return Math.min(300000, Math.max(60000, count * 30000));
 }
 
 // Reverse direction of prepareM365Attachments: upload files the MODEL produced
@@ -2104,7 +2162,7 @@ async function uploadArtifactsToSharePoint(files) {
     const timer = setTimeout(() => {
       sharePointUploadWaiters.delete(uploadRequestId);
       reject(new Error("SharePoint artifact upload completion timed out"));
-    }, 60000);
+    }, sharePointUploadTimeoutMs(raw.length));
     sharePointUploadWaiters.set(uploadRequestId, {
       resolve: (value) => {
         clearTimeout(timer);
@@ -2153,7 +2211,51 @@ async function uploadArtifactsToSharePoint(files) {
 // change. Turns with artifactCount==0 skip all of this (a strict no-op), and
 // the whole feature is one flag away from being disabled.
 const M365_INJECT_ARTIFACT_LINKS = true; // flip to false to fully disable
-const M365_ARTIFACT_LINK_TIMEOUT_MS = 20000; // ceiling on how long DONE is held
+// 内联图片：把模型产出的图片作为 data-URI markdown 直接嵌入答案，Continue 可内联渲染。
+// data-URI 不依赖 SharePoint 登录态、不会过期、进对话历史也不裂（与短时效 downloadUrl 相反）。
+const M365_INLINE_IMAGES = true; // flip to false 关闭内联，退回纯链接
+// 单图内联 base64 上限。base64 会跨 extension→Python 的本地 WSS 桥（随 M365_DONE.appendText），
+// 桥端 max_msg_size 已抬到 32MiB（见 voice_edge.py 补丁 B），这里再设单图 ~3MB 上限做双保险；
+// 超限的图片回退为 SharePoint 链接，绝不丢。
+const M365_INLINE_IMAGE_MAX_B64 = 3 * 1024 * 1024;
+const _veIsImageMime = (m) => /^image\//i.test(String(m || ""));
+// Size-aware ceiling on how long a DONE is held waiting for artifact uploads
+// to settle. A flat 20s dropped large files: a ~1.4MB script whose
+// addUsingPath + read-back GET + driveItem verification (with 503 backoff
+// retries) runs well past 20s finalized at settled<expected, losing the late
+// SharePoint link. Two inconsistencies drove the bug: (a) each artifact's OWN
+// upload budget is sharePointUploadTimeoutMs(1)=60s, far longer than the 20s
+// hold, so a legitimately-slow-but-successful upload was abandoned; (b) larger
+// payloads need extra read-back/verify time. Scale accordingly:
+//   floor 65s  — just above the 60s per-file upload budget, so a single slow
+//                upload always finishes before finalize gives up;
+//   +20s / MB  — extra budget for large-file read-back/verification;
+//   cap 150s   — MUST stay below Python's M365_IDLE_TIMEOUT (180s): while a DONE
+//                is held the extension forwards no relay frames, so an over-long
+//                hold would let Python idle-tear-down and drop the held terminal.
+//                A periodic keepalive (below) further guards this, but the cap is
+//                the hard safety bound. The common case still finalizes early via
+//                settled>=expected, so this only bounds the pathological hang.
+const M365_ARTIFACT_LINK_TIMEOUT_FLOOR_MS = 65000;
+const M365_ARTIFACT_LINK_MS_PER_MB = 20000;
+const M365_ARTIFACT_LINK_TIMEOUT_CAP_MS = 150000;
+// Liveness ping cadence while a DONE is held. Empty-text M365_PROGRESS is the
+// codebase's established pure-liveness contract (flips got_any / resets the
+// Python idle timer, never written to the answer), so pinging every few seconds
+// keeps the relay alive through an arbitrarily long (but capped) upload wait.
+const M365_ARTIFACT_HOLD_KEEPALIVE_MS = 5000;
+function m365ArtifactHoldMs(totalBytes) {
+  const mb = Math.max(0, Number(totalBytes) || 0) / (1024 * 1024);
+  return Math.min(
+    M365_ARTIFACT_LINK_TIMEOUT_CAP_MS,
+    Math.max(
+      M365_ARTIFACT_LINK_TIMEOUT_FLOOR_MS,
+      Math.round(
+        M365_ARTIFACT_LINK_TIMEOUT_FLOOR_MS + mb * M365_ARTIFACT_LINK_MS_PER_MB,
+      ),
+    ),
+  );
+}
 const m365ArtifactTurns = new Map(); // request id -> per-turn injection state
 
 function m365ArtifactTurn(id) {
@@ -2163,8 +2265,11 @@ function m365ArtifactTurn(id) {
       expected: null, // artifactCount from DONE; null until DONE seen
       settled: 0, // uploads/errors resolved for this id so far
       descriptors: [], // successful SharePoint descriptors (name/url/downloadUrl)
+      images: [], // {name, mimeType, dataUrl} 于 harvest 时同步记录，独立于 SP 上传
+      bytes: 0, // 累计已观测 artifact 字节数，用于按大小动态计算持有窗口
       doneMessage: null, // the held terminal payload
       timer: null,
+      keepAliveTimer: null, // 持有期间的 Python liveness 保活 interval
       finalized: false,
     };
     m365ArtifactTurns.set(id, state);
@@ -2188,7 +2293,51 @@ function m365ForwardToPy(message) {
     authoritative: message.authoritative === true,
     turnState: message.turnState,
     deltaSource: message.deltaSource,
+    // Out-of-band trailing block (SharePoint artifact links). Carried on its
+    // OWN field instead of being spliced into `text`, so Python can deliver it
+    // as a final delta unconditionally — even when this turn's authoritative
+    // terminal snapshot diverged from the streamed text and is dropped as
+    // non-prefix (the exact case that silently ate the links before).
+    appendText: message.appendText,
   });
+}
+
+// (Re)arm the size-aware finalize hold for a turn whose DONE is being held.
+// Called once when the held DONE is first seen, and again whenever a later
+// M365_ARTIFACT grows state.bytes — so a large payload that only becomes known
+// after DONE still extends the window. Idempotent: clears any prior timer /
+// keepalive first. No-op once finalized or before a DONE is held.
+function m365ArmArtifactHold(id) {
+  const state = m365ArtifactTurns.get(id);
+  if (!state || state.finalized || !state.doneMessage) return;
+  if (state.timer !== null) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  if (state.keepAliveTimer !== null) {
+    clearInterval(state.keepAliveTimer);
+    state.keepAliveTimer = null;
+  }
+  const holdMs = m365ArtifactHoldMs(state.bytes);
+  state.timer = setTimeout(
+    () => m365FinalizeArtifactTurn(id, "timeout"),
+    holdMs,
+  );
+  // Keep the Python relay alive for the whole (bounded) hold so an upload that
+  // legitimately runs tens of seconds cannot be pre-empted by the 180s idle
+  // teardown. Empty-text M365_PROGRESS is pure liveness (never written to the
+  // answer). Cleared on finalize.
+  state.keepAliveTimer = setInterval(() => {
+    const s = m365ArtifactTurns.get(id);
+    if (!s || s.finalized) return;
+    sendM365({ type: "M365_PROGRESS", id, text: "" });
+  }, M365_ARTIFACT_HOLD_KEEPALIVE_MS);
+  dlog(
+    "artifact hold (re)armed id=%s bytes=%d holdMs=%d",
+    id,
+    state.bytes,
+    holdMs,
+  );
 }
 
 function m365FinalizeArtifactTurn(id, reason) {
@@ -2199,28 +2348,67 @@ function m365FinalizeArtifactTurn(id, reason) {
     clearTimeout(state.timer);
     state.timer = null;
   }
+  if (state.keepAliveTimer !== null) {
+    clearInterval(state.keepAliveTimer);
+    state.keepAliveTimer = null;
+  }
   m365ArtifactTurns.delete(id);
   const done = state.doneMessage;
-  const links = state.descriptors
-    .map((d) => {
-      const name = String((d && d.name) || "").trim();
-      const dl = d && d.downloadUrl ? "[下载链接](" + d.downloadUrl + ")" : "";
-      const pl = d && d.url ? "[永久链接](" + d.url + ")" : "";
-      const parts = [dl, pl].filter(Boolean).join(", ");
-      if (!parts) return "";
-      return name ? "- " + name + "：" + parts : "- " + parts;
-    })
-    .filter(Boolean);
-  if (links.length && typeof done.text === "string") {
-    // Append-only so the streamed answer stays a strict prefix of DONE.text;
-    // Python then streams exactly this block as the final delta.
-    done.text = done.text + "\n\n已上传到 SharePoint：\n" + links.join("\n");
+
+  // 描述符按文件名索引，便于给内联图片补上 SharePoint 链接
+  const descByName = new Map();
+  for (const d of state.descriptors) {
+    const n = String((d && d.name) || "").trim();
+    if (n && !descByName.has(n)) descByName.set(n, d);
+  }
+  const usedNames = new Set();
+  const blocks = [];
+
+  // 1) 内联图片（data-URI）—— 独立于 SharePoint 是否成功；下方附带 SP 链接（若有）
+  for (const img of state.images || []) {
+    const name = String(img.name || "").trim();
+    const cap = name || "image";
+    const d = name ? descByName.get(name) : null;
+    if (d) usedNames.add(name);
+    const links = d
+      ? [
+          d.downloadUrl ? "[下载](" + d.downloadUrl + ")" : "",
+          d.url ? "[永久链接](" + d.url + ")" : "",
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : "";
+    blocks.push(
+      "![" + cap + "](" + img.dataUrl + ")" + (links ? "\n" + links : ""),
+    );
+  }
+
+  // 2) 非内联产物（非图片，或超限回退）—— 保持原纯文本链接形式
+  for (const d of state.descriptors) {
+    const name = String((d && d.name) || "").trim();
+    if (name && usedNames.has(name)) continue; // 已作为内联图片处理
+    const dl = d && d.downloadUrl ? "[下载链接](" + d.downloadUrl + ")" : "";
+    const pl = d && d.url ? "[永久链接](" + d.url + ")" : "";
+    const parts = [dl, pl].filter(Boolean).join(", ");
+    if (!parts) continue;
+    blocks.push(name ? "- " + name + "：" + parts : "- " + parts);
+  }
+
+  if (blocks.length) {
+    // 有内联图片时图片即主体，不加“已上传到 SharePoint”前缀；纯链接时保留原前缀。
+    // 仍走 done.appendText 专用字段（不拼进 done.text），因此与终态快照 prefix 校验无关，
+    // 不会被 Python 的 non-prefix 丢弃逻辑连带丢掉。
+    const hasInline = (state.images || []).length > 0;
+    done.appendText = hasInline
+      ? "\n\n" + blocks.join("\n\n")
+      : "\n\n已上传到 SharePoint：\n" + blocks.join("\n");
   }
   dlog(
-    "artifact-link finalize id=%s reason=%s links=%d settled=%d/%s",
+    "artifact finalize id=%s reason=%s images=%d descriptors=%d settled=%d/%s",
     id,
     reason,
-    links.length,
+    (state.images || []).length,
+    state.descriptors.length,
     state.settled,
     String(state.expected),
   );
@@ -2430,6 +2618,41 @@ browser.runtime.onMessage.addListener((message, sender) => {
         size: Number(message.size || 0),
         mimeType: String(message.mimeType || "application/octet-stream"),
       };
+      // 累计本轮 artifact 字节数，并按新的总字节数延长持有窗口。artifact 常在 DONE
+      // 之后才 harvest 到（harvestOne 轮询最多 ~6s），大文件的字节数此时才可知——
+      // 若不在这里重新计算窗口，DONE 处按当时（可能为 0）字节 arm 的窗口会偏短，
+      // 大文件上传仍会被超时甩掉（本次 voice_edge.py 1.4MB 掉队的成因）。字节数只增，
+      // 故窗口只会延长；m365ArmArtifactHold 在 DONE 未到/已 finalize 时是 no-op。
+      if (track) {
+        const fileBytes =
+          file.size > 0 ? file.size : Math.floor((file.data.length * 3) / 4);
+        const state = m365ArtifactTurn(id);
+        state.bytes += Math.max(0, fileBytes);
+        m365ArmArtifactHold(id);
+      }
+      // 先同步记录可内联的图片（独立于 SharePoint 成败/是否配置）。哪怕后面 SP 上传失败或
+      // 超时，图片也已经在 state.images 里，finalize 时照样内联出图。
+      if (
+        track &&
+        M365_INLINE_IMAGES &&
+        _veIsImageMime(file.mimeType) &&
+        file.data
+      ) {
+        if (file.data.length <= M365_INLINE_IMAGE_MAX_B64) {
+          const state = m365ArtifactTurn(id);
+          state.images.push({
+            name: file.name,
+            mimeType: file.mimeType,
+            dataUrl: "data:" + file.mimeType + ";base64," + file.data,
+          });
+        } else {
+          dlog(
+            "artifact too large to inline, link-only name=%s b64=%d",
+            file.name,
+            file.data.length,
+          );
+        }
+      }
       if (file.name && file.data) {
         // Always resolves (never rejects) to a descriptor array, so the
         // settled-counter below advances on both success and failure.
@@ -2544,22 +2767,23 @@ browser.runtime.onMessage.addListener((message, sender) => {
       // immediately, so the streaming path is byte-for-byte unchanged.
       if (
         message.type === "M365_DONE" &&
-        M365_INJECT_ARTIFACT_LINKS &&
-        sharePointHomeUrl &&
         Number(message.artifactCount || 0) > 0 &&
-        String(message.id || "")
+        String(message.id || "") &&
+        // 满足任一即持有：①要注入 SP 链接且已配置；②要内联图片（不依赖 SharePoint）
+        ((M365_INJECT_ARTIFACT_LINKS && sharePointHomeUrl) ||
+          M365_INLINE_IMAGES)
       ) {
         const id = String(message.id);
         const state = m365ArtifactTurn(id);
         state.expected = Number(message.artifactCount) || 0;
         state.doneMessage = message;
-        // Safety net: never hold the answer open indefinitely. If uploads are
-        // slow or an expected artifact never reports, release with whatever
-        // links succeeded (possibly none).
-        state.timer = setTimeout(
-          () => m365FinalizeArtifactTurn(id, "timeout"),
-          M365_ARTIFACT_LINK_TIMEOUT_MS,
-        );
+        // Safety net: never hold the answer open indefinitely. The hold is
+        // sized from the artifact bytes already observed (m365ArmArtifactHold),
+        // and re-armed as later/larger artifacts arrive, so a big file gets a
+        // proportionally longer window instead of the old flat 20s that dropped
+        // it. If uploads are slow or an expected artifact never reports, the
+        // (bounded) timer still releases with whatever links succeeded.
+        m365ArmArtifactHold(id);
         // Artifacts (and their uploads) may already have settled before this
         // DONE arrived, in which case finalize right away.
         m365MaybeFinalizeArtifactTurn(id);
@@ -2574,6 +2798,8 @@ browser.runtime.onMessage.addListener((message, sender) => {
         const state = id && m365ArtifactTurns.get(id);
         if (state) {
           if (state.timer !== null) clearTimeout(state.timer);
+          if (state.keepAliveTimer !== null)
+            clearInterval(state.keepAliveTimer);
           m365ArtifactTurns.delete(id);
         }
       }

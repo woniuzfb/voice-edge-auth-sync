@@ -396,6 +396,60 @@
         }, 15000);
       });
     }
+    // 上传单张图片到 BizChat，返回可用于 messageAnnotations 的 docId。
+    // 端点与 Chathub 同属 substrate.office.com/m365Copilot/*，因此复用 Sydney token。
+    // file: { name, mimeType, dataBase64 } —— dataBase64 可带或不带 data: 前缀
+    async function uploadImageToM365(file, conversationId, oid, tid) {
+      const token = await requestSydneyToken();
+      // 补齐 data URL 前缀（UploadFile 的 FileBase64 期望完整 data:*;base64, 串）
+      let b64 = String(file.dataBase64 || "");
+      if (!/^data:/i.test(b64)) {
+        b64 = "data:" + (file.mimeType || "image/png") + ";base64," + b64;
+      }
+      const fd = new FormData();
+      fd.append("scenario", "UploadImage");
+      fd.append("conversationId", String(conversationId || ""));
+      fd.append("FileBase64", b64);
+      // 抓包里这三个 optionsSets 各占一段，FormData 允许重复 key
+      fd.append("optionsSets", "cwcgptvsan");
+      fd.append(
+        "optionsSets",
+        "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+      );
+      fd.append("optionsSets", "gptvnorm2048");
+
+      const res = await fetch(
+        "https://substrate.office.com/m365Copilot/UploadFile",
+        {
+          method: "POST",
+          // 不要手动设 Content-Type：让浏览器自带 multipart boundary
+          headers: {
+            Accept: "*/*",
+            Authorization: "Bearer " + token,
+            "x-anchormailbox": "Oid:" + oid + "@" + tid,
+            "x-scenario": "owahub",
+            "x-variants": "feature.EnableImageSupportInUploadFile",
+          },
+          body: fd,
+        },
+      );
+      const text = await res.text();
+      let json = {};
+      try {
+        json = text ? JSON.parse(text) : {};
+      } catch (_) {}
+      if (!res.ok || !json.docId) {
+        throw new Error(
+          "UploadFile failed (" +
+            res.status +
+            "): " +
+            String(
+              json.error || (json.result && json.result.message) || text,
+            ).slice(0, 300),
+        );
+      }
+      return json.docId; // e.g. "0-eus-d5-ab087f10c64e9689517a5eab0185791c"
+    }
     // background 回传 token
     window.addEventListener("message", (ev) => {
       const d = ev.data;
@@ -441,7 +495,8 @@
     // ---- 自建 Chathub WSS,发一轮,读流 ----
     function buildChatArgs(text, tone, conversationId, attachments = []) {
       const rid = uuid();
-      const messageAnnotations = attachments
+      // FileUrl（ODB 文档）—— 这条会触发 officeweb 分支
+      const fileUrlAnnotations = attachments
         .filter(
           (file) =>
             file &&
@@ -457,7 +512,29 @@
           url: String(file.url),
           messageAnnotationType: "FileUrl",
         }));
-      const hasAttachments = messageAnnotations.length > 0;
+      // ImageFile（图片 blob）—— 只需已拿到 docId；保持 owahub 默认帧
+      const imageAnnotations = attachments
+        .filter((file) => file && file.docId && file.kind === "image")
+        .map((file) => {
+          const ext =
+            String(file.name || "")
+              .split(".")
+              .pop()
+              .toLowerCase() || "png";
+          return {
+            id: String(file.docId),
+            messageAnnotationMetadata: {
+              "@type": "File",
+              annotationType: "File",
+              fileType: ext, // 裸扩展名
+              fileName: String(file.name || "image." + ext),
+            },
+            messageAnnotationType: "ImageFile",
+          };
+        });
+      const messageAnnotations = [...fileUrlAnnotations, ...imageAnnotations];
+      // 关键：只有 FileUrl 才切 officeweb；纯图片留在 owahub 默认分支。
+      const hasAttachments = fileUrlAnnotations.length > 0;
       const capturedAttachmentOptionsSets = [
         "search_result_progress_messages_with_search_queries",
         "update_textdoc_response_after_streaming",
@@ -557,7 +634,7 @@
                 "flux_v3_image_gen_enable_system_text_with_params",
                 "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
                 "flux_v3_image_gen_enable_story",
-                ...(messageAnnotations.length ? ["cwc_fileupload_odb"] : []),
+                ...(fileUrlAnnotations.length ? ["cwc_fileupload_odb"] : []),
               ],
           streamingMode: "ConciseWithPadding",
           options: {},
@@ -679,8 +756,29 @@
 
         const sid = uuid(),
           reqSess = uuid();
+        // 图片附件：send 前先上传拿 docId，回填到 attachment，供 buildChatArgs 生成
+        // ImageFile 注解。上传失败只丢弃该图、不阻断整轮。
+        for (const f of Array.isArray(attachments) ? attachments : []) {
+          if (f && f.kind === "image" && f.dataBase64 && !f.docId) {
+            try {
+              f.docId = await uploadImageToM365(f, convId, oid, tid);
+              dbg("image uploaded name=%s docId=%s", f.name, f.docId);
+            } catch (e) {
+              post({
+                type: "M365_ATTACH_ERROR",
+                id,
+                name: f.name,
+                error: String((e && e.message) || e),
+              });
+            }
+          }
+        }
+        // transport/officeweb 只由 FileUrl 决定；纯图片轮保持 owahub。
         const hasAttachments =
-          Array.isArray(attachments) && attachments.length > 0;
+          Array.isArray(attachments) &&
+          attachments.some(
+            (a) => a && a.url && a.verified === true && a.itemId && a.driveId,
+          );
         const transportProfile = hasAttachments
           ? "&source=%22officeweb%22&product=Office&agentHost=Bizchat.ChatPanel" +
             "&licenseType=Starter&isEdu=true&agent=work&scenario=officeweb"
@@ -832,19 +930,166 @@
               if (r) scan(r.targetLink);
             }
         };
-        const artifactNameFromUrl = (url, disposition) => {
-          const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(
-            String(disposition || ""),
+        // 无死角兜底：整帧扫描 asyncgw 对象 URL。collectArtifacts 只看两个固定
+        // 字段（seeMoreUrl / targetLink），而 URL 在不同轮次会落到不同字段（长回答 +
+        // result.message 分叉时尤甚），漏掉就会 artifactUrls.size===0 -> artifactCount=0
+        // -> background 不 hold 终态 -> appendText 从不生成 -> 链接与内联图全丢（本次现象）。
+        // 对每一帧 JSON.stringify 后全局正则抓取，捕获 URL 无论嵌在哪个字段；Set 幂等，
+        // 与上面的字段扫描叠加无副作用，也绝不触碰答案文本流。反斜杠排除在字符类外，
+        // 避免把 JSON 转义或结尾的 \" 卷进 URL。
+        const AMS_OBJECT_RE_G =
+          /https:\/\/[^"'\s\\]*asyncgw[^"'\s\\]*\/v1\/objects\/[^"'\s\\]*/gi;
+        const collectArtifactsDeep = (frame) => {
+          if (frame == null) return;
+          let s;
+          try {
+            s = typeof frame === "string" ? frame : JSON.stringify(frame);
+          } catch (_) {
+            return;
+          }
+          if (!s) return;
+          const hits = s.match(AMS_OBJECT_RE_G);
+          if (hits) for (const u of hits) artifactUrls.add(u);
+        };
+        // RFC 2047 encoded-word 解码（=?utf-8?B?..?= / =?utf-8?Q?..?=）。
+        // AMS 的 Content-Disposition 常把中文名编成 encoded-word，
+        // decodeURIComponent 不认这种编码，直接返回会残留 ? = 等字符，
+        // 而这些正是 SharePoint 文件名的非法字符，导致 addUsingPath 被拒。
+        const decodeMimeWord = (s) =>
+          String(s).replace(
+            /=\?(utf-8)\?([bq])\?([^?]*)\?=/gi,
+            (_, _cs, enc, data) => {
+              try {
+                if (enc.toLowerCase() === "b") {
+                  const bin = atob(data);
+                  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+                  return new TextDecoder("utf-8").decode(bytes);
+                }
+                // Q-encoding: _ => space, =XX => byte
+                const q = data
+                  .replace(/_/g, " ")
+                  .replace(/=([0-9A-Fa-f]{2})/g, (_m, h) =>
+                    String.fromCharCode(parseInt(h, 16)),
+                  );
+                const bytes = Uint8Array.from(q, (c) => c.charCodeAt(0));
+                return new TextDecoder("utf-8").decode(bytes);
+              } catch (_) {
+                return "";
+              }
+            },
           );
-          if (m && m[1]) return decodeURIComponent(m[1].trim());
+        // SharePoint 文件名非法字符： \ / : * ? " < > | 以及首尾空白/点。
+        const sanitizeName = (s) =>
+          String(s || "")
+            .trim()
+            .replace(/[\\/:*?"<>|]/g, "_")
+            .replace(/^\.+|\.+$/g, "")
+            .trim();
+        const artifactNameFromUrl = (url, disposition) => {
+          const dispo = String(disposition || "");
+          // 优先 RFC 5987: filename*=UTF-8''%E8%AF%BE...
+          let m = /filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(dispo);
+          if (m && m[1]) {
+            const decoded = sanitizeName(
+              decodeURIComponent(m[1].trim().replace(/^"|"$/g, "")),
+            );
+            if (decoded) return decoded;
+          }
+          // 再 filename="..."，可能是 RFC 2047 encoded-word
+          m = /filename\s*=\s*"?([^";]+)"?/i.exec(dispo);
+          if (m && m[1]) {
+            let raw = m[1].trim();
+            if (/=\?[^?]+\?[bq]\?/i.test(raw)) raw = decodeMimeWord(raw);
+            const decoded = sanitizeName(raw);
+            if (decoded) return decoded;
+          }
           const parts = String(url).split("?")[0].split("/").filter(Boolean);
           const last = parts[parts.length - 1] || "";
           // ".../views/original[/<name>]" — "original" means no trailing name.
           return last && last.toLowerCase() !== "original"
-            ? decodeURIComponent(last)
+            ? sanitizeName(decodeURIComponent(last))
             : "artifact-" + Date.now();
         };
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        // 由扩展名推断图片 mime。仅覆盖常见图片类型，其余返回 ""（保持 octet-stream）。
+        const guessMimeFromName = (name) => {
+          const ext = String(name || "")
+            .toLowerCase()
+            .split(".")
+            .pop();
+          return (
+            {
+              png: "image/png",
+              jpg: "image/jpeg",
+              jpeg: "image/jpeg",
+              gif: "image/gif",
+              webp: "image/webp",
+              bmp: "image/bmp",
+              svg: "image/svg+xml",
+            }[ext] || ""
+          );
+        };
+        // 由文件头 magic bytes 嗅探图片 mime（比扩展名更可靠，即便无扩展名也能识别）。
+        const sniffImageMime = (bytes) => {
+          const b = bytes || [];
+          if (
+            b.length >= 8 &&
+            b[0] === 0x89 &&
+            b[1] === 0x50 &&
+            b[2] === 0x4e &&
+            b[3] === 0x47
+          )
+            return "image/png";
+          if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff)
+            return "image/jpeg";
+          if (
+            b.length >= 4 &&
+            b[0] === 0x47 &&
+            b[1] === 0x49 &&
+            b[2] === 0x46 &&
+            b[3] === 0x38
+          )
+            return "image/gif";
+          if (
+            b.length >= 12 &&
+            b[0] === 0x52 &&
+            b[1] === 0x49 &&
+            b[2] === 0x46 &&
+            b[3] === 0x46 &&
+            b[8] === 0x57 &&
+            b[9] === 0x45 &&
+            b[10] === 0x42 &&
+            b[11] === 0x50
+          )
+            return "image/webp";
+          if (b.length >= 2 && b[0] === 0x42 && b[1] === 0x4d)
+            return "image/bmp";
+          return "";
+        };
+        // 从 base64 头部解出前若干字节用于嗅探（不解整包，够识别 magic 即可）。
+        const headBytesFromB64 = (b64) => {
+          try {
+            const bin = atob(String(b64 || "").slice(0, 32));
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+            return out;
+          } catch (_) {
+            return new Uint8Array(0);
+          }
+        };
+        // 综合决策：magic 嗅探优先，其次扩展名，再次响应头，最后 octet-stream。
+        // 关键点：无论走 page-tee 还是 fallback，图片都能拿到 image/* 类型，
+        // 这样 background.js 的 _veIsImageMime 才会命中并内联为 data-URI；
+        // 同时 data:image/png;base64 头正确，浏览器/Continue 才能直接渲染。
+        const resolveMime = (bytes, name, headerMime) => {
+          const sniffed = sniffImageMime(bytes);
+          if (sniffed) return sniffed;
+          const byName = guessMimeFromName(name);
+          if (byName) return byName;
+          const hm = String(headerMime || "").trim();
+          if (hm && !/octet-stream/i.test(hm)) return hm;
+          return "application/octet-stream";
+        };
         const harvestOne = async (url) => {
           // The AMS endpoint serves bytes at ".../views/original"; the captured
           // link often appends the display filename, and that longer path 404s.
@@ -857,11 +1102,12 @@
           for (let i = 0; i < 12; i++) {
             const b64 = _amsBytes.get(fetchUrl);
             if (b64) {
+              const nm = artifactNameFromUrl(url, null);
               post({
                 type: "M365_ARTIFACT",
                 id,
                 url,
-                name: artifactNameFromUrl(url, null),
+                name: nm,
                 size: (function () {
                   try {
                     return atob(b64).length;
@@ -869,7 +1115,9 @@
                     return 0;
                   }
                 })(),
-                mimeType: "application/octet-stream",
+                // 曾硬编码 octet-stream，导致 background 的 _veIsImageMime 判定失败、
+                // 图片被当成普通文件走纯链接，从不内联。改为按 magic bytes + 扩展名推断。
+                mimeType: resolveMime(headBytesFromB64(b64), nm, null),
                 data: b64,
                 source: "page-tee",
               });
@@ -910,17 +1158,20 @@
                 usedPageAuth: auth === _amsPageAuth && !!_amsPageAuth,
               });
             const buf = await res.arrayBuffer();
+            const nm = artifactNameFromUrl(
+              url,
+              res.headers.get("content-disposition"),
+            );
+            const head = new Uint8Array(buf.slice(0, 16));
             post({
               type: "M365_ARTIFACT",
               id,
               url,
-              name: artifactNameFromUrl(
-                url,
-                res.headers.get("content-disposition"),
-              ),
+              name: nm,
               size: buf.byteLength,
-              mimeType:
-                res.headers.get("content-type") || "application/octet-stream",
+              // AMS 下载端点常返回 octet-stream，直接采信会漏判图片。改为按 magic bytes +
+              // 扩展名推断，仅在两者都无结论时才回退到响应头 / octet-stream。
+              mimeType: resolveMime(head, nm, res.headers.get("content-type")),
               data: bufToB64(buf),
               source: auth ? "authed-fetch" : "bare-fetch",
             });
@@ -1141,6 +1392,11 @@
           armIdleTimeout();
           const run = (s) => {
             for (const f of parseFrames(s)) {
+              // 每帧先做无死角 URL 扫描，保证 type=2/type=3 的 done() 读取
+              // artifactUrls.size 时，本帧携带的对象 URL 已全部入集（type=2 与
+              // type=3 常在同一 ws 消息内先后到达，循环里 type=2 先被扫，再轮到
+              // type=3 的 done()，时序正确）。
+              collectArtifactsDeep(f);
               if (!handshook) {
                 // 首个 {} 是握手 OK
                 handshook = true;
@@ -1261,6 +1517,21 @@
               } else if (f.type === 2) {
                 const item = f.item || {};
                 const result = (item && item.result) || {};
+                // Artifact download URLs (asyncgw/v1/objects/…) frequently live
+                // ONLY on the authoritative type=2 result — its resolved
+                // sourceAttributions/references — with no preceding type=1
+                // snapshot carrying them (type=3 can follow type=2 in the same
+                // frame). collectArtifacts was previously called only in the
+                // type=1 update loop, so those turns finished with
+                // artifactUrls.size===0 -> artifactCount=0 -> background never
+                // held the terminal -> the SharePoint link block was silently
+                // dropped (links only, answer text unaffected). Scan the
+                // authoritative result/item/messages here too. artifactUrls is
+                // a Set, so this is idempotent with any type=1 hits — no dupes.
+                collectArtifacts(result);
+                collectArtifacts(item);
+                if (Array.isArray(item.messages))
+                  for (const m of item.messages) collectArtifacts(m);
                 if (typeof result.message === "string" && result.message) {
                   // AUTHORITATIVE full-turn text: this is the server's final
                   // message with citations already resolved — the single source
