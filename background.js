@@ -2266,6 +2266,7 @@ function m365ArtifactTurn(id) {
       settled: 0, // uploads/errors resolved for this id so far
       descriptors: [], // successful SharePoint descriptors (name/url/downloadUrl)
       images: [], // {name, mimeType, dataUrl} 于 harvest 时同步记录，独立于 SP 上传
+      artifactKeys: new Set(), // 同一产物可能被多个 WSS 消息/URL 重复 harvest；只消费一次
       bytes: 0, // 累计已观测 artifact 字节数，用于按大小动态计算持有窗口
       doneMessage: null, // the held terminal payload
       timer: null,
@@ -2618,15 +2619,40 @@ browser.runtime.onMessage.addListener((message, sender) => {
         size: Number(message.size || 0),
         mimeType: String(message.mimeType || "application/octet-stream"),
       };
-      // 累计本轮 artifact 字节数，并按新的总字节数延长持有窗口。artifact 常在 DONE
-      // 之后才 harvest 到（harvestOne 轮询最多 ~6s），大文件的字节数此时才可知——
-      // 若不在这里重新计算窗口，DONE 处按当时（可能为 0）字节 arm 的窗口会偏短，
-      // 大文件上传仍会被超时甩掉（本次 voice_edge.py 1.4MB 掉队的成因）。字节数只增，
-      // 故窗口只会延长；m365ArmArtifactHold 在 DONE 未到/已 finalize 时是 no-op。
+      // M365 有时会在多个消息分支中重复公布同一个对象 URL，harvester 随后会把
+      // 完全相同的 artifact 发送多次。若每帧都上传/入 blocks，DONE.appendText 就会
+      // 生成重复下载链接。以文件名、声明大小和 base64 内容的首尾指纹做 turn 内去重；
+      // 不只按文件名去重，避免合法的同名不同内容产物被吞掉。
+      let state = null;
       if (track) {
+        state = m365ArtifactTurn(id);
+        const artifactKey = [
+          file.name,
+          String(file.size || ""),
+          String(file.mimeType || "").toLowerCase(),
+          file.data.length,
+          file.data.slice(0, 96),
+          file.data.slice(-96),
+        ].join("\u0000");
+        if (state.artifactKeys.has(artifactKey)) {
+          dlog("duplicate M365 artifact ignored id=%s name=%s", id, file.name);
+          // 该重复产物在 content-m365 侧仍对应 artifactCount 里的一个唯一 URL，
+          // harvestOne 为它 post 了这一帧。若这里直接 return 而不推进 settled，
+          // settled 就永远停在 expected-1，m365MaybeFinalizeArtifactTurn 的快速
+          // finalize（settled>=expected）永不触发，DONE 只能干等 hold 定时器超时
+          // 才收尾——每个带重复产物的回复都被拖慢甚至掉队。照 malformed 分支的做法
+          // 照常记一次 settled 并尝试 finalize，再丢弃这帧的字节/上传。
+          state.settled += 1;
+          m365MaybeFinalizeArtifactTurn(id);
+          return;
+        }
+        state.artifactKeys.add(artifactKey);
+      }
+      // 累计本轮 artifact 字节数，并按新的总字节数延长持有窗口。artifact 常在 DONE
+      // 之后才 harvest 到（harvestOne 轮询最多 ~6s），大文件的字节数此时才可知。
+      if (state) {
         const fileBytes =
           file.size > 0 ? file.size : Math.floor((file.data.length * 3) / 4);
-        const state = m365ArtifactTurn(id);
         state.bytes += Math.max(0, fileBytes);
         m365ArmArtifactHold(id);
       }

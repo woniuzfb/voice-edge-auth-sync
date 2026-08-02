@@ -488,6 +488,7 @@
           String(d.tone || "Claude_Opus"),
           String(d.conversationId || ""),
           Array.isArray(d.attachments) ? d.attachments : [],
+          Number(d.idleTimeoutMs || 0),
         );
       }
     });
@@ -733,7 +734,14 @@
       };
     }
 
-    async function doAsk(id, text, tone, conversationId, attachments = []) {
+    async function doAsk(
+      id,
+      text,
+      tone,
+      conversationId,
+      attachments = [],
+      requestedIdleTimeoutMs = 0,
+    ) {
       let ws = null;
       try {
         const token = await requestSydneyToken();
@@ -880,6 +888,21 @@
         // makes later authoritative snapshots fail the prefix guard.
         let sawSnapshot = false;
         let activeAnswerMessageId = "";
+        // Whether the CURRENT answer segment issued a tool call (carried an
+        // `invocation`). Capture-verified pattern (3/3 restarts): a
+        // segment that ends in a tool call is superseded by a NEW messageId whose
+        // text shares no prefix with it — either the model narrates a ReAct step
+        // then continues or abandons a draft and re-answers. Either
+        // way the finished segment was already streamed live to Continue over an
+        // append-only SSE and CANNOT be retracted, so we keep it and just separate
+        // it from the post-tool output with a blank line.
+        let curSegHadInvocation = false;
+        // A plain blank line only. The answer is already broken up by interleaved
+        // thinking/tool blocks, so a paragraph break matches that rhythm; no visual
+        // rule ("---") is added since we have no evidence for how the page renders
+        // these segments and the same signal covers both ReAct narration and
+        // re-answers.
+        const TOOL_STEP_SEPARATOR = "\n\n";
         // Switch the active segment when the server moves to a new answer
         // messageId. The finished segment is committed verbatim; NO prefix check
         // is applied across segments (that is exactly the bug that dropped the
@@ -891,9 +914,11 @@
             curId = mid;
           } else if (mid !== curId) {
             committed += curBest;
+            if (curSegHadInvocation) committed += TOOL_STEP_SEPARATOR;
             curBest = "";
             curId = mid;
             sawSnapshot = false; // snapshot-vs-writeAtCursor is per segment
+            curSegHadInvocation = false; // tool-call flag is per segment
           }
         };
         let handshook = false;
@@ -1346,7 +1371,13 @@
         // physically silent for the full window. Whether answer *content* is
         // still arriving is a separate concern already enforced by the Python
         // relay's content-based idle timeout, so the two layers do not overlap.
-        const IDLE_TIMEOUT_MS = 180000;
+        // Python computes one size/count-aware budget from the original upload
+        // metadata and sends it with M365_ASK. Clamp here so a malformed relay
+        // cannot disable the watchdog; older senders retain the 180s behavior.
+        const IDLE_TIMEOUT_MS = Math.min(
+          900000,
+          Math.max(180000, Number(requestedIdleTimeoutMs) || 180000),
+        );
         const armIdleTimeout = () => {
           if (terminal) return;
           if (timeoutTimer !== null) clearTimeout(timeoutTimer);
@@ -1355,7 +1386,10 @@
               done({
                 type: "M365_ERROR",
                 id,
-                error: "M365 websocket idle timeout (no frames for 180s)",
+                error:
+                  "M365 websocket idle timeout (no frames for " +
+                  Math.round(IDLE_TIMEOUT_MS / 1000) +
+                  "s)",
               }),
             IDLE_TIMEOUT_MS,
           );
@@ -1511,6 +1545,11 @@
                         "messages-snapshot",
                         message.messageId,
                       );
+                    // Remember that this answer segment issued a tool call. The
+                    // `invocation` arrives on the segment's own frame (after its
+                    // text), so curId already points at this segment; ensureSegment
+                    // uses the flag to delimit it once a new segment supersedes it.
+                    if ("invocation" in message) curSegHadInvocation = true;
                   }
                 if (typeof a.writeAtCursor === "string")
                   publishCursorDelta(a.writeAtCursor);
@@ -1533,23 +1572,44 @@
                 if (Array.isArray(item.messages))
                   for (const m of item.messages) collectArtifacts(m);
                 if (typeof result.message === "string" && result.message) {
-                  // AUTHORITATIVE full-turn text: this is the server's final
-                  // message with citations already resolved — the single source
-                  // of truth for the whole answer. Adopt it WHOLESALE and bypass
-                  // the append-only prefix guard (that guard exists for
-                  // provisional streaming snapshots, not for the final message).
-                  // This is the core fix: previously result.message was fed back
-                  // through publishSnapshot and rejected as "non-prefix" when it
-                  // resolved 【1-xxxx】 into the \ue200cite…\ue201 form, freezing
-                  // the answer at the citation and dropping the tail. totalText()
-                  // (used by the type=3 DONE below) now equals this full text.
-                  committed = result.message;
-                  curBest = "";
+                  // AUTHORITATIVE text with citations resolved. CAPTURE-VERIFIED
+                  // : result.message carries ONLY the LAST answer segment,
+                  // NOT the whole turn — the earlier segment is absent from it.
+                  //
+                  // The type=1 accumulator has ALREADY streamed the full turn as
+                  // committed(prior segments) + curBest(current segment); for a
+                  // multi-segment / tool-preamble turn that is A + B. So the old
+                  // `committed = result.message` OVERWROTE the whole accumulated
+                  // A + B with B-only, dropping every earlier segment — the actual
+                  // text-loss root cause. (It only looked fine when the Python relay
+                  // happened to reject the shorter B-only post as non-prefix.)
+                  //
+                  // Reconcile instead of overwrite: result.message is the resolved
+                  // form of the CURRENT segment. Keep the already-committed prior
+                  // segments and adopt result.message as curBest. stripCites lets a
+                  // pure citation resolution (【1-xxxx】 → \ue200cite…\ue201) of the
+                  // current segment still be recognized, and the whole-turn case
+                  // (result.message already spans committed) still adopts wholesale.
+                  if (
+                    committed &&
+                    !stripCites(result.message).startsWith(
+                      stripCites(committed),
+                    )
+                  ) {
+                    // Multi-segment: result.message == authoritative CURRENT segment
+                    // only. Preserve prior segments (committed), refresh curBest.
+                    curBest = result.message;
+                  } else {
+                    // Single-segment turn, or result.message already spans the whole
+                    // answer: adopt wholesale (original citation-resolution fix).
+                    committed = result.message;
+                    curBest = "";
+                  }
                   sawSnapshot = true;
                   post({
                     type: "M365_DELTA",
                     id,
-                    text: committed,
+                    text: totalText(),
                     deltaSource: "type2-final",
                   });
                 } else {
