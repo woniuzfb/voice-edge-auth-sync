@@ -2300,6 +2300,10 @@ function m365ForwardToPy(message) {
     // terminal snapshot diverged from the streamed text and is dropped as
     // non-prefix (the exact case that silently ate the links before).
     appendText: message.appendText,
+    // Diagnostic-only per-turn artScan counters (see content-m365 done()).
+    // Forwarded so they surface in the Python [relay-artifact] log; background
+    // itself never acts on this field.
+    artScanSummary: message.artScanSummary,
   });
 }
 
@@ -2586,6 +2590,11 @@ browser.runtime.onMessage.addListener((message, sender) => {
     if (message.type === "M365_NEED_AMS_TOKEN") {
       // IC3-audience token for artifact (AMS) downloads; see refreshIc3Token.
       try {
+        // A forced request (content-side 401/403 retry) invalidates the cached
+        // IC3 token so refreshIc3Token mints a brand-new one instead of handing
+        // back the stale token that just 401'd. (Any refresh already in flight
+        // still fetches a fresh token, so this cannot return the stale one.)
+        if (message.force) _ic3 = { token: "", exp: 0 };
         const token = await refreshIc3Token();
         sendToM365Frame(sender, {
           type: "M365_AMS_TOKEN",

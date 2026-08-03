@@ -380,13 +380,18 @@
     // Mirrors requestSydneyToken but over the M365_NEED_AMS_TOKEN channel.
     let _amsTokenCache = { token: "", exp: 0 };
     const _amsTokenWaiters = [];
-    function requestAmsToken() {
+    function requestAmsToken(forceRefresh) {
       return new Promise((resolve, reject) => {
+        // forceRefresh (used on a 401/403 retry) drops the cached token so a
+        // fresh IC3-audience token is minted; the flag is forwarded so
+        // background invalidates ITS cache too — otherwise both sides would
+        // hand back the same stale token and the retry could never recover.
+        if (forceRefresh) _amsTokenCache = { token: "", exp: 0 };
         if (_amsTokenCache.token && _amsTokenCache.exp - Date.now() > 90000) {
           return resolve(_amsTokenCache.token);
         }
         _amsTokenWaiters.push({ resolve, reject });
-        post({ type: "M365_NEED_AMS_TOKEN" });
+        post({ type: "M365_NEED_AMS_TOKEN", force: !!forceRefresh });
         setTimeout(() => {
           const i = _amsTokenWaiters.findIndex((w) => w.resolve === resolve);
           if (i >= 0) {
@@ -938,13 +943,63 @@
         // and fetched once at terminal, off the answer path.
         const artifactUrls = new Set();
         let artifactsHarvested = false;
+        // OBSERVATION-ONLY per-turn artifact-detection counters (gated by
+        // window.__veM365Debug via dbg()). These NEVER touch artifactUrls or
+        // any behavior; they exist only to classify, on the NEXT missing-link
+        // occurrence, WHY artifactCount ended at 0 (read alongside the Python
+        // [relay-artifact] line):
+        //   loose_asyncgw=0            -> no AMS URL appeared in ANY frame this
+        //     turn (upstream M365 did not emit it) == NOT a plugin bug.
+        //   loose_asyncgw>0 & strict_urls=0 -> a URL WAS present but the strict
+        //     AMS_OBJECT_RE_G (or cleanAmsUrl) rejected it (a detection gap);
+        //     the per-frame "MISSED" dbg below shows its real shape to fix.
+        const artScan = {
+          frames: 0, // frames passed through collectArtifactsDeep
+          looseAsyncgw: 0, // frames whose text contained "asyncgw"
+          looseObjects: 0, // frames whose text contained "/v1/objects/"
+          missed: 0, // frames with a loose marker but strict added nothing
+          // Up to ARTSCAN_MISSED_CAP short, redacted windows around the loose
+          // marker of a MISSED frame — rides the DONE payload to the PYTHON
+          // [relay-artifact] log so the real URL SHAPE is diagnosable without
+          // the page console. Bounded in count AND per-snippet length so a
+          // pathological turn cannot bloat the terminal payload.
+          missedSnippets: [],
+          // Loose-URL fingerprints already accounted for this turn. A single
+          // artifact URL is echoed across MANY type=1 frames; strict uses a
+          // Set so only the FIRST frame grows artifactUrls, and every later
+          // echo used to be counted as a fresh "missed" (9 identical MISSED
+          // lines for one already-harvested file). Dedup on the normalized URL
+          // so "missed" reflects only a GENUINELY-undetected url, not repeats.
+          seenLoose: new Set(),
+        };
+        const ARTSCAN_MISSED_CAP = 6;
+        const ARTSCAN_SNIPPET_LEN = 160;
+        // Sanitize a captured AMS object URL before it enters artifactUrls.
+        // Two failure modes were observed when a URL appeared in the ANSWER
+        // PROSE rather than a citation field (e.g. the model literally writing
+        // an asyncgw/objects URL in its answer text): (a) trailing markdown /
+        // sentence punctuation captured from "[name](URL)" or "URL." → a
+        // malformed target that 404s (".../voice_edge.py)"); (b) the bare
+        // ".../v1/objects/" prefix with no object id → 405. Strip trailing
+        // delimiters and REQUIRE a non-empty object-id path segment; return ""
+        // for anything that is not a fetchable AMS object URL.
+        const cleanAmsUrl = (raw) => {
+          let u = String(raw || "").trim();
+          u = u.replace(/[)\]}>,.;:!?'"\u3001\uff0c\u3002\uff09\u3011]+$/u, "");
+          const m = /\/v1\/objects\/([^/?#\s]+)/i.exec(u);
+          if (!/asyncgw/i.test(u) || !m || !m[1]) return "";
+          return u;
+        };
         const AMS_OBJECT_RE =
           /https:\/\/[^"'\s]*asyncgw[^"'\s]*\/v1\/objects\/[^"'\s]*/i;
         const collectArtifacts = (message) => {
           if (!message || typeof message !== "object") return;
           const scan = (url) => {
             const s = String(url || "");
-            if (AMS_OBJECT_RE.test(s)) artifactUrls.add(s);
+            if (AMS_OBJECT_RE.test(s)) {
+              const c = cleanAmsUrl(s);
+              if (c) artifactUrls.add(c);
+            }
           };
           const sa = message.sourceAttributions;
           if (Array.isArray(sa)) for (const s of sa) if (s) scan(s.seeMoreUrl);
@@ -963,7 +1018,7 @@
         // 与上面的字段扫描叠加无副作用，也绝不触碰答案文本流。反斜杠排除在字符类外，
         // 避免把 JSON 转义或结尾的 \" 卷进 URL。
         const AMS_OBJECT_RE_G =
-          /https:\/\/[^"'\s\\]*asyncgw[^"'\s\\]*\/v1\/objects\/[^"'\s\\]*/gi;
+          /https:\/\/[^"'\s\\)\]]*asyncgw[^"'\s\\)\]]*\/v1\/objects\/[^"'\s\\)\]]*/gi;
         const collectArtifactsDeep = (frame) => {
           if (frame == null) return;
           let s;
@@ -973,8 +1028,65 @@
             return;
           }
           if (!s) return;
+          const before = artifactUrls.size;
           const hits = s.match(AMS_OBJECT_RE_G);
-          if (hits) for (const u of hits) artifactUrls.add(u);
+          if (hits)
+            for (const u of hits) {
+              const c = cleanAmsUrl(u);
+              if (c) artifactUrls.add(c);
+            }
+          // OBSERVATION-ONLY (no behavior change): a loose substring probe that
+          // runs regardless of whether the strict regex+cleanAmsUrl accepted a
+          // url. If a frame clearly references an AMS artifact ("asyncgw" or
+          // "/v1/objects/") yet NO new url entered artifactUrls, detection has a
+          // gap; dbg a short redacted window around the marker so its real shape
+          // is visible next time. Purely diagnostic; artifactUrls is untouched.
+          try {
+            artScan.frames += 1;
+            const lo = s.toLowerCase();
+            const hasAsyncgw = lo.indexOf("asyncgw") >= 0;
+            const hasObjects = lo.indexOf("/v1/objects/") >= 0;
+            if (hasAsyncgw) artScan.looseAsyncgw += 1;
+            if (hasObjects) artScan.looseObjects += 1;
+            if ((hasAsyncgw || hasObjects) && artifactUrls.size === before) {
+              // This frame carried an AMS marker but added no NEW strict url.
+              // Decide whether that is a GENUINE miss or just a repeat of an
+              // already-known url. Extract this frame's loose AMS urls, cleanUp
+              // each to the same key strict would use, and only count/report a
+              // url that is neither already in artifactUrls (strict-detected)
+              // nor already tallied this turn. If every loose url here is a
+              // known repeat, this frame is benign and is NOT counted.
+              const looseHits = s.match(AMS_OBJECT_RE_G) || [];
+              const genuinelyNew = [];
+              for (const h of looseHits) {
+                const key = cleanAmsUrl(h) || h; // fall back to raw if unclean
+                if (artifactUrls.has(key)) continue; // strict already has it
+                if (artScan.seenLoose.has(key)) continue; // already tallied
+                artScan.seenLoose.add(key);
+                genuinelyNew.push(key);
+              }
+              if (genuinelyNew.length) {
+                artScan.missed += 1;
+                const at = lo.indexOf("asyncgw");
+                const idx = at >= 0 ? at : lo.indexOf("/v1/objects/");
+                const snippet = s
+                  .slice(Math.max(0, idx - 24), idx + ARTSCAN_SNIPPET_LEN)
+                  .replace(/\s+/g, " ");
+                if (artScan.missedSnippets.length < ARTSCAN_MISSED_CAP) {
+                  artScan.missedSnippets.push(
+                    "t" + (frame && frame.type) + ":" + snippet,
+                  );
+                }
+                if (window.__veM365Debug) {
+                  dbg(
+                    "[artifact-scan] loose marker but strict MISSED:",
+                    "frameType=" + (frame && frame.type),
+                    "snippet=" + JSON.stringify(snippet),
+                  );
+                }
+              }
+            }
+          } catch (_) {}
         };
         // RFC 2047 encoded-word 解码（=?utf-8?B?..?= / =?utf-8?Q?..?=）。
         // AMS 的 Content-Disposition 常把中文名编成 encoded-word，
@@ -1165,50 +1277,84 @@
               if (t) auth = "Bearer " + t;
             } catch (_) {}
           }
-          const headers = { Accept: "*/*", "MS-IC3-Product": "Copilot" };
-          if (auth) headers["Authorization"] = auth;
-          try {
-            const res = await fetch(fetchUrl, {
-              method: "GET",
-              credentials: "omit",
-              headers,
-            });
-            if (!res.ok)
-              return post({
-                type: "M365_ARTIFACT_ERROR",
-                id,
-                url,
-                fetchUrl,
-                error: "fetch " + res.status,
-                usedPageAuth: auth === _amsPageAuth && !!_amsPageAuth,
+          // Bounded retry with exponential backoff + jitter for the AMS fetch.
+          // Error classification (retry must not waste attempts on permanent
+          // failures):
+          //   * transient  → retry: network/timeout (no status), 408/425/429,
+          //     500/502/503/504, and any other unclassified status.
+          //   * auth 401/403 → FORCE-refresh the IC3 token (bypassing both the
+          //     content and background caches), then retry.
+          //   * permanent  → do NOT retry: 400/404/405/410/411/413/414/415/422.
+          //     A 404/405 here almost always means the URL is bogus or the
+          //     object is gone (e.g. a placeholder URL that leaked into the
+          //     answer prose), which no number of retries can fix.
+          const AMS_PERMANENT = new Set([
+            400, 404, 405, 410, 411, 413, 414, 415, 422,
+          ]);
+          const AMS_MAX_ATTEMPTS = 4;
+          let lastError = "unknown";
+          let lastStatus = 0;
+          for (let attempt = 1; attempt <= AMS_MAX_ATTEMPTS; attempt++) {
+            const headers = { Accept: "*/*", "MS-IC3-Product": "Copilot" };
+            if (auth) headers["Authorization"] = auth;
+            try {
+              const res = await fetch(fetchUrl, {
+                method: "GET",
+                credentials: "omit",
+                headers,
               });
-            const buf = await res.arrayBuffer();
-            const nm = artifactNameFromUrl(
-              url,
-              res.headers.get("content-disposition"),
-            );
-            const head = new Uint8Array(buf.slice(0, 16));
-            post({
-              type: "M365_ARTIFACT",
-              id,
-              url,
-              name: nm,
-              size: buf.byteLength,
-              // AMS 下载端点常返回 octet-stream，直接采信会漏判图片。改为按 magic bytes +
-              // 扩展名推断，仅在两者都无结论时才回退到响应头 / octet-stream。
-              mimeType: resolveMime(head, nm, res.headers.get("content-type")),
-              data: bufToB64(buf),
-              source: auth ? "authed-fetch" : "bare-fetch",
-            });
-          } catch (e) {
-            post({
-              type: "M365_ARTIFACT_ERROR",
-              id,
-              url,
-              fetchUrl,
-              error: String((e && e.message) || e),
-            });
+              if (res.ok) {
+                const buf = await res.arrayBuffer();
+                const nm = artifactNameFromUrl(
+                  url,
+                  res.headers.get("content-disposition"),
+                );
+                const head = new Uint8Array(buf.slice(0, 16));
+                post({
+                  type: "M365_ARTIFACT",
+                  id,
+                  url,
+                  name: nm,
+                  size: buf.byteLength,
+                  mimeType: resolveMime(
+                    head,
+                    nm,
+                    res.headers.get("content-type"),
+                  ),
+                  data: bufToB64(buf),
+                  source: auth ? "authed-fetch" : "bare-fetch",
+                });
+                return;
+              }
+              lastStatus = res.status;
+              lastError = "fetch " + res.status;
+              if (AMS_PERMANENT.has(res.status)) break;
+              if (res.status === 401 || res.status === 403) {
+                try {
+                  const t = await requestAmsToken(true);
+                  if (t) auth = "Bearer " + t;
+                } catch (_) {}
+              }
+            } catch (e) {
+              lastStatus = 0; // network/timeout → transient
+              lastError = String((e && e.message) || e);
+            }
+            if (attempt < AMS_MAX_ATTEMPTS) {
+              const backoff =
+                Math.min(4000, 400 * 2 ** (attempt - 1)) +
+                Math.floor(Math.random() * 200);
+              await sleep(backoff);
+            }
           }
+          post({
+            type: "M365_ARTIFACT_ERROR",
+            id,
+            url,
+            fetchUrl,
+            error: lastError,
+            status: lastStatus,
+            usedPageAuth: auth === _amsPageAuth && !!_amsPageAuth,
+          });
         };
         const harvestArtifacts = () => {
           if (artifactsHarvested) return;
@@ -1350,6 +1496,40 @@
           try {
             if (payload && payload.type === "M365_DONE") {
               payload.artifactCount = artifactUrls.size;
+              // Ride the per-turn artScan counters ON the DONE payload so they
+              // reach the PYTHON [relay-artifact] log (via background
+              // m365ForwardToPy) — no page console needed. Diagnostic only;
+              // background does not act on it and it never touches answer text.
+              payload.artScanSummary = {
+                frames: artScan.frames,
+                strictUrls: artifactUrls.size,
+                looseAsyncgw: artScan.looseAsyncgw,
+                looseObjects: artScan.looseObjects,
+                missed: artScan.missed,
+                missedSnippets: artScan.missedSnippets,
+              };
+            }
+          } catch (_) {}
+          // OBSERVATION-ONLY per-turn artifact-detection summary. Read it on the
+          // authoritative DONE alongside the Python [relay-artifact] line:
+          //   strict_urls=0 & loose_asyncgw=0  -> upstream emitted NO artifact
+          //     URL this turn (not a plugin bug; nothing to harvest).
+          //   strict_urls=0 & loose_asyncgw>0  -> the URL WAS present but strict
+          //     detection/cleanAmsUrl missed it (a plugin gap); the per-frame
+          //     "MISSED" dbg lines show the exact shape to fix with.
+          //   strict_urls>0                    -> detection worked; a later
+          //     missing link is a harvest/upload/hold issue, not detection.
+          try {
+            if (payload && payload.type === "M365_DONE") {
+              dbg(
+                "[artifact-scan] summary",
+                "id=" + id,
+                "frames=" + artScan.frames,
+                "strict_urls=" + artifactUrls.size,
+                "loose_asyncgw=" + artScan.looseAsyncgw,
+                "loose_objects=" + artScan.looseObjects,
+                "missed=" + artScan.missed,
+              );
             }
           } catch (_) {}
           if (timeoutTimer !== null) clearTimeout(timeoutTimer);
