@@ -9,7 +9,7 @@
  *                 scope=https://substrate.office.com/sydney/.default)→ 滚动续期
  *   content(page world):
  *     M365_ASK 到来 → 使用 Python 指定的 ConversationId，空值则新建
- *       → 在正确的 outlook.office.com frame 建立 page-world Chathub WebSocket
+ *       → 在正确的 m365copilotapp.svc.cloud.microsoft frame 建立 page-world Chathub WebSocket
  *       → 握手 {"protocol":"json","version":1}\x1e → 收 {} → 发 chat+Metrics 帧
  *       → 按 cursor messageId 读取正文快照/writeAtCursor 增量→ type2/type3 收尾
  * ========================================================================= */
@@ -20,12 +20,12 @@
     "use strict";
     // Origin self-gate. The manifest injects this script into every frame of
     // three match origins (outlook.cloud.microsoft, m365.cloud.microsoft,
-    // outlook.office.com) with all_frames:true, so every host-shell subframe
+    // m365copilotapp.svc.cloud.microsoft) with all_frames:true, so every host-shell subframe
     // also advertises itself as a Chathub-socket candidate. Only the
-    // outlook.office.com frame ever builds the working socket (observed
+    // m365copilotapp.svc.cloud.microsoft frame ever builds the working socket (observed
     // frameOrigin in every VE-FRAME-READY). We therefore BLOCK the two proven
     // host-shell origins from advertising as socket candidates, and FAIL OPEN
-    // for outlook.office.com and any unforeseen origin — gating can only ever
+    // for m365copilotapp.svc.cloud.microsoft and any unforeseen origin — gating can only ever
     // remove known-noise candidates, never suppress a frame that might be the
     // real one, so it cannot break connectivity. Entry discovery
     // (M365_ENTRY_DISCOVERED) is deliberately NOT gated: it must keep reporting
@@ -937,7 +937,7 @@
         // asyncgw.teams.microsoft.com/v1/objects/… (verified in captures
         // references.targetLink, sourceAttributions.seeMoreUrl;
         // the field varies per turn, so BOTH are scanned). Those URLs are
-        // fetchable with a bare, credential-less GET from this outlook.office.com
+        // fetchable with a bare, credential-less GET from this m365copilotapp.svc.cloud.microsoft
         // page origin (probe verified: default GET -> 200 + bytes;
         // credentials:include -> 401). URLs are collected while parsing frames
         // and fetched once at terminal, off the answer path.

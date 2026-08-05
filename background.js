@@ -1872,6 +1872,7 @@ async function ensureM365Tab() {
     url: [
       "https://outlook.cloud.microsoft/*",
       "https://outlook.office.com/*",
+      "https://m365copilotapp.svc.cloud.microsoft/*",
       "https://m365.cloud.microsoft/*",
     ],
   });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Voice Edge Auth Sync",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "Syncs browser authentication and conversation state for Voice Edge, including M365 Copilot Chathub.",
   "browser_specific_settings": {
     "gecko": {
@@ -27,6 +27,7 @@
     "https://substrate.office.com/*",
     "https://outlook.cloud.microsoft/*",
     "https://outlook.office.com/*",
+    "https://m365copilotapp.svc.cloud.microsoft/*",
     "https://m365.cloud.microsoft/*",
     "https://*.sharepoint.com/*"
   ],
@@ -43,7 +44,8 @@
       "matches": [
         "https://outlook.cloud.microsoft/*",
         "https://m365.cloud.microsoft/*",
-        "https://outlook.office.com/*"
+        "https://outlook.office.com/*",
+        "https://m365copilotapp.svc.cloud.microsoft/*"
       ],
       "js": ["content-m365.js"],
       "run_at": "document_start",
