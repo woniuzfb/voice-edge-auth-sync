@@ -163,6 +163,12 @@
         Object.assign({ __veM365: true, dir: "fromPage" }, m),
         "*",
       );
+    // Registry of in-flight doAsk turns, keyed by the Python request id, so an
+    // M365_STOP from the bridge can abort the exact turn the client (Continue)
+    // interrupted. Without this the self-built Chathub socket keeps streaming
+    // after the client is gone; Python then logs [relay-inbound-drop] no pending
+    // queue for that id and the browser silently finishes an answer nobody sees.
+    const _veActiveAsks = new Map();
     // Gated page-world tracing. OFF by default; enable live from the page
     // console with `window.__veM365Debug = true` (no reload). Focused on the
     // conversation-id decision and terminal signal.
@@ -495,6 +501,14 @@
           Array.isArray(d.attachments) ? d.attachments : [],
           Number(d.idleTimeoutMs || 0),
         );
+      } else if (d.type === "M365_STOP") {
+        // Abort the in-flight turn for this id (client interrupted the request).
+        // dbg makes it unambiguous whether the STOP reached THIS frame and
+        // whether the id was live here (routing vs registry miss).
+        const _veStopId = String(d.id || "");
+        const stop = _veActiveAsks.get(_veStopId);
+        dbg("M365_STOP page recv id=%s known=%s", _veStopId, !!stop);
+        if (stop) stop();
       }
     });
 
@@ -748,6 +762,21 @@
       requestedIdleTimeoutMs = 0,
     ) {
       let ws = null;
+      // Register this turn so a bridge M365_STOP can abort it. A stop can arrive
+      // during the pre-socket awaits below (token fetch / image upload) before
+      // the socket-level teardown exists, so record intent in _veAborted and
+      // install the real teardown (_veAbortLocal) once done() is defined.
+      let _veAborted = false;
+      let _veAbortLocal = null;
+      const _veOnStop = () => {
+        _veAborted = true;
+        if (_veAbortLocal) {
+          try {
+            _veAbortLocal();
+          } catch (_) {}
+        }
+      };
+      _veActiveAsks.set(id, _veOnStop);
       try {
         const token = await requestSydneyToken();
         const claims = jwtClaims(token);
@@ -818,6 +847,13 @@
           VARIANTS +
           transportProfile;
 
+        // Honor a stop that arrived during the pre-socket awaits: never open
+        // the Chathub socket for a turn the client already abandoned.
+        if (_veAborted) {
+          _veActiveAsks.delete(id);
+          dbg("doAsk aborted before socket open id=%s", id);
+          return;
+        }
         ws = new WebSocket(url); // browser supplies this frame's Origin
         const { args } = buildChatArgs(text, tone, convId, attachments);
         const invId = "0"; // 全新 socket,首个调用用 "0"(每 socket 只发一轮)
@@ -1538,8 +1574,35 @@
           try {
             ws.close();
           } catch (_) {}
+          _veActiveAsks.delete(id);
           post(payload);
         };
+        // Socket-level teardown for a bridge M365_STOP: mark this turn terminal,
+        // stop timers, close the Chathub socket so the model stops generating.
+        // Setting terminal=true FIRST makes ws.onclose skip its "closed before
+        // terminal" error and makes done() a no-op, so aborting posts NO terminal
+        // answer frame to Python (whose relay queue for this id is already gone).
+        // It DOES post a diagnostic-only M365_STOPPED receipt (background dlogs
+        // it; never forwarded to Python, never enters the answer stream).
+        _veAbortLocal = () => {
+          if (terminal) return;
+          terminal = true;
+          if (timeoutTimer !== null) clearTimeout(timeoutTimer);
+          if (completionFallbackTimer !== null)
+            clearTimeout(completionFallbackTimer);
+          try {
+            if (ws) ws.close();
+          } catch (_) {}
+          _veActiveAsks.delete(id);
+          post({ type: "M365_STOPPED", id });
+          dbg("doAsk aborted by M365_STOP id=%s", id);
+        };
+        // A stop observed between socket creation and handler wiring is honored
+        // now, before the read loop is armed.
+        if (_veAborted) {
+          _veAbortLocal();
+          return;
+        }
         // Idle watchdog, not a wall-clock cap. The previous implementation armed
         // a single 180s timeout at socket-open and never reset it, so a healthy
         // but long/slow answer (e.g. Claude Opus reasoning with web/work search
@@ -1851,6 +1914,7 @@
         try {
           if (ws) ws.close();
         } catch (_) {}
+        _veActiveAsks.delete(id);
         post({ type: "M365_ERROR", id, error: String((e && e.message) || e) });
       }
     }

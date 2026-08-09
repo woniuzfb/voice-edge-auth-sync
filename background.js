@@ -1854,6 +1854,14 @@ function m365Connect() {
       if (message.entryUrl) setM365EntryUrl(message.entryUrl).catch(() => {});
       dispatchM365(message);
     }
+    if (message.type === "M365_STOP") {
+      dlog(
+        "M365_STOP recv id=%s reason=%s",
+        String(message.id || ""),
+        String(message.reason || ""),
+      );
+      routeM365Stop(message.id);
+    }
   });
   m365Ws.addEventListener("close", () => {
     m365Ws = null;
@@ -2429,6 +2437,58 @@ function m365MaybeFinalizeArtifactTurn(id) {
   }
 }
 
+// Exact frame that accepted each id's ASK (tabId+frameId). The socket that
+// streams a turn lives in ONE specific (often cross-origin) subframe; routing
+// STOP to that frameId — the SAME way M365_ASK is delivered — is reliable, where
+// a tab-level broadcast was not (the observed "M365_STOP recv but no
+// M365_STOPPED, drops persist" bug).
+const m365AskFrameById = new Map();
+
+// Abort an in-flight M365 turn the client (e.g. Continue) interrupted. Deliver
+// M365_STOP to the exact frame that ran this id's ASK (frameId-targeted), then
+// to the sticky target and every known candidate frame as a fallback, so the
+// frame whose self-built Chathub socket is streaming closes it and the model
+// stops. A frame not running the id no-ops (its page-world registry has no
+// entry). Also release any held terminal/artifact state for the id.
+function routeM365Stop(id) {
+  const rid = String(id || "");
+  if (!rid) return;
+  const targets = [];
+  const seen = new Set();
+  const pushFrame = (f) => {
+    if (!f || f.tabId == null || f.frameId == null) return;
+    const key = f.tabId + ":" + f.frameId;
+    if (seen.has(key)) return;
+    seen.add(key);
+    targets.push(f);
+  };
+  pushFrame(m365AskFrameById.get(rid)); // exact frame first
+  pushFrame(m365TargetFrame);
+  for (const f of m365FrameCandidates.values()) pushFrame(f);
+  dlog(
+    "routeM365Stop id=%s targets=%d exact=%s",
+    rid,
+    targets.length,
+    m365AskFrameById.has(rid),
+  );
+  for (const f of targets) {
+    browser.tabs
+      .sendMessage(
+        f.tabId,
+        { __veM365ToPage: true, payload: { type: "M365_STOP", id: rid } },
+        { frameId: f.frameId },
+      )
+      .catch(() => {});
+  }
+  m365AskFrameById.delete(rid);
+  const state = m365ArtifactTurns.get(rid);
+  if (state) {
+    if (state.timer !== null) clearTimeout(state.timer);
+    if (state.keepAliveTimer !== null) clearInterval(state.keepAliveTimer);
+    m365ArtifactTurns.delete(rid);
+  }
+}
+
 async function dispatchM365(message) {
   // Liveness ack: tell Python we accepted the request the instant it arrives,
   // before any slow browser-side preparation (tab cold-start, SharePoint
@@ -2471,6 +2531,13 @@ async function dispatchM365(message) {
         );
         if (ack && ack.relayed === true) {
           m365TargetFrame = target; // make the proven-live frame sticky
+          // Remember the EXACT frame for this id so a later M365_STOP can be
+          // delivered straight to the frame whose Chathub socket is streaming.
+          if (message.id)
+            m365AskFrameById.set(String(message.id), {
+              tabId: tab.id,
+              frameId: target.frameId,
+            });
           delivered = true;
           dlog(
             "dispatch delivered id=%s frameId=%s frameUrl=%s",
@@ -2766,6 +2833,14 @@ browser.runtime.onMessage.addListener((message, sender) => {
     // (append-only per content-m365), keeping any surfaced reasoning off the
     // answer path. The liveness ping alone fixes the loss even if the relay
     // ignores M365_REASONING.
+    if (message.type === "M365_STOPPED") {
+      // Diagnostic confirmation that a bridge M365_STOP reached the page world
+      // and tore down that turn's Chathub socket. dlog only; deliberately NOT
+      // forwarded to Python (not in the relay whitelist), so it never touches
+      // the answer stream.
+      dlog("M365_STOPPED recv id=%s", String(message.id || ""));
+      return;
+    }
     if (message.type === "M365_PROGRESS") {
       sendM365({ type: "M365_PROGRESS", id: message.id, text: "" });
       return;
