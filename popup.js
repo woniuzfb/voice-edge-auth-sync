@@ -172,10 +172,24 @@ function render(state) {
   // ---------------- SharePoint Online ----------------
   const sp = state.sharepoint || {};
   const spr = sp.lastResult || null;
-  setStatus($("sp-status"), !sp.configured ? "未配置" : spr && spr.ok ? "已连接" : sp.readyPageUrl ? "页面已就绪" : "等待页面", !sp.configured ? "err" : spr && spr.ok ? "ok" : "warn");
+  setStatus(
+    $("sp-status"),
+    !sp.configured
+      ? "未配置"
+      : spr && spr.ok
+        ? "已连接"
+        : sp.readyPageUrl
+          ? "页面已就绪"
+          : "等待页面",
+    !sp.configured ? "err" : spr && spr.ok ? "ok" : "warn",
+  );
   setRow("sp-home-row", "sp-home", sp.homeUrl || "");
   setRow("sp-folder-row", "sp-folder", sp.uploadFolder || "");
-  setRow("sp-result-row", "sp-result", spr ? (spr.error || spr.serverRelativeUrl || spr.title || "成功") : "");
+  setRow(
+    "sp-result-row",
+    "sp-result",
+    spr ? spr.error || spr.serverRelativeUrl || spr.title || "成功" : "",
+  );
   $("sp-test").disabled = !sp.configured;
   $("sp-upload-test").disabled = !sp.configured;
 
@@ -224,12 +238,20 @@ function render(state) {
   setNewButton("m365", anyM365Conversation);
   $("m365-clear-auth").disabled = !m365.authAvailable;
 
-  const canSync =
-    Boolean(cap && cap.complete && !cap.error) && !db.syncInFlight;
+  const hasUsableCapture = Boolean(cap && cap.complete && !cap.error);
+  const captureApplied = hasUsableCapture && db.lastCaptureApplied;
   const btn = $("sync-doubao");
   btn.hidden = !cap;
-  btn.disabled = !canSync;
-  btn.textContent = db.syncInFlight ? "同步中…" : "立即同步豆包状态";
+  btn.disabled = !hasUsableCapture || db.syncInFlight || captureApplied;
+  if (db.syncInFlight) {
+    btn.textContent = "同步中…";
+  } else if (captureApplied) {
+    btn.textContent = "豆包状态已同步";
+  } else if (db.authRequired) {
+    btn.textContent = "立即同步豆包状态";
+  } else {
+    btn.textContent = "重新发送最近豆包快照";
+  }
 }
 
 async function refresh() {
@@ -316,7 +338,10 @@ async function sharePointAction(type) {
   hint.textContent = "处理中…";
   try {
     const result = await browser.runtime.sendMessage({ type });
-    hint.textContent = result && result.ok ? (result.serverRelativeUrl || result.title || "成功") : ((result && result.error) || "失败");
+    hint.textContent =
+      result && result.ok
+        ? result.serverRelativeUrl || result.title || "成功"
+        : (result && result.error) || "失败";
     hint.className = "ve-hint " + (result && result.ok ? "ok" : "err");
   } catch (error) {
     hint.textContent = String((error && error.message) || error);
@@ -346,8 +371,12 @@ document.addEventListener("DOMContentLoaded", () => {
   $("reconnect").addEventListener("click", reconnect);
   $("sync-doubao").addEventListener("click", syncDoubao);
   $("m365-clear-auth").addEventListener("click", clearM365Auth);
-  $("sp-test").addEventListener("click", () => sharePointAction("POPUP_SP_TEST"));
-  $("sp-upload-test").addEventListener("click", () => sharePointAction("POPUP_SP_UPLOAD_TEST"));
+  $("sp-test").addEventListener("click", () =>
+    sharePointAction("POPUP_SP_TEST"),
+  );
+  $("sp-upload-test").addEventListener("click", () =>
+    sharePointAction("POPUP_SP_UPLOAD_TEST"),
+  );
   for (const b of document.querySelectorAll(".ve-open")) {
     b.addEventListener("click", () =>
       openProvider(b.getAttribute("data-open")),

@@ -892,6 +892,11 @@ function popupBuildState() {
       authRequired: Boolean(authRequired),
       authRequiredSince: Number(authRequiredSince || 0),
       syncInFlight: Boolean(syncInFlight),
+      lastCaptureApplied: Boolean(
+        lastCaptured &&
+        captureKey(lastCaptured) &&
+        captureKey(lastCaptured) === lastAppliedKey,
+      ),
       lastCapture:
         lastCaptured && lastCaptured.conversation
           ? {
@@ -2103,7 +2108,21 @@ async function prepareM365Attachments(message) {
         waiter.resolve({ ok: false, error: compactError(error) });
       }
     });
-  const response = await completion;
+  // Keep the Python relay alive for the whole (now up to 10min) upload wait.
+  // dispatchM365 only pings once before and once after prepareM365Attachments,
+  // so without this a slow multi-file upload produced NO frames for minutes and
+  // Python could idle-tear-down the request. Empty-text M365_PROGRESS is the
+  // established pure-liveness contract (flips got_any / resets the idle timer,
+  // never written to the answer).
+  const uploadKeepAlive = setInterval(() => {
+    sendM365({ type: "M365_PROGRESS", id: String(message.id || ""), text: "" });
+  }, M365_ARTIFACT_HOLD_KEEPALIVE_MS);
+  let response;
+  try {
+    response = await completion;
+  } finally {
+    clearInterval(uploadKeepAlive);
+  }
   sharePointUploadWaiters.delete(uploadRequestId);
   if (!response || !response.ok) {
     throw new Error(
@@ -2143,11 +2162,16 @@ async function prepareM365Attachments(message) {
 // those can burn several exponential-backoff retries against a throttling
 // (503) tenant. A flat 60s aborted large or throttled batches mid-flight and
 // surfaced as a misleading "completion event timed out" while uploads were
-// still succeeding. Floor 60s (unchanged for the common 1-file case), +30s per
-// file, capped at 5min so a stuck batch still fails in bounded time.
+// still succeeding. Floor 120s (common 1-file case), +60s per file, capped at
+// 10min so a stuck batch still fails in bounded time.
+//
+// 上传多个大文件时旧的 5min(300s) 上限仍会触发
+// "SharePoint upload completion event timed out"，按需再放宽一倍：floor 60->120s、
+// 每文件 30->60s、cap 300->600s。600s 仍安全低于 Python 端 M365_IDLE_MAX_SECONDS(900s)，
+// 且上传等待期间下面新增了周期性 M365_PROGRESS 保活，Python relay 不会在此期间被 idle 拆掉。
 function sharePointUploadTimeoutMs(fileCount) {
   const count = Math.max(1, Number(fileCount) || 1);
-  return Math.min(300000, Math.max(60000, count * 30000));
+  return Math.min(600000, Math.max(120000, count * 60000));
 }
 
 // Reverse direction of prepareM365Attachments: upload files the MODEL produced

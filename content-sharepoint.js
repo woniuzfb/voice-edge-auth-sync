@@ -70,12 +70,42 @@
   // jitter, honoring Retry-After when present. Every retried request in the
   // upload path is idempotent (contextinfo POST; addUsingPath uses
   // overwrite=true; the read-backs are GETs), so replay is safe. 4xx other
-  // than 429 (auth, not-found, bad request) is NOT retried — it will not fix
-  // itself and must surface immediately.
-  const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+  // than the transient ones below (auth, not-found, bad request) is NOT retried
+  // — it will not fix itself and must surface immediately.
+  //   408 Request Timeout — server-side timeout, safe to replay an idempotent op.
+  //   423 Locked          — SharePoint co-authoring / background job holds a
+  //                         short-lived lock on the item; clears on its own.
+  const RETRYABLE_STATUS = new Set([408, 423, 429, 500, 502, 503, 504]);
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   function backoffDelay(base, attempt) {
     return base * 2 ** attempt + Math.floor(Math.random() * 300);
+  }
+  // Upper bound on how long we will honor a server Retry-After. SharePoint
+  // throttling frequently returns Retry-After of 60–300s; sleeping the full
+  // value unbounded (a) can exceed the background completion budget
+  // (sharePointUploadTimeoutMs, now capped at 600s) so the waiter times out
+  // while a request is still sleeping, and (b) stalls the whole batch on one
+  // hot request. Cap the honored delay and let normal exponential backoff take
+  // over past the cap; the request still retries, just sooner.
+  const RETRY_AFTER_MAX_MS = 60000;
+  // Parse a Retry-After header into a bounded millisecond delay. Supports BOTH
+  // wire forms: delta-seconds ("120") and the HTTP-date form
+  // ("Wed, 21 Oct 2026 07:28:00 GMT") — the old Number()-only path silently
+  // dropped the date form (Number("Wed,...") === NaN) and fell back to backoff,
+  // ignoring the server's hint. Returns 0 when absent/unparseable/in the past
+  // so the caller falls back to exponential backoff.
+  function parseRetryAfterMs(headerValue) {
+    const raw = String(headerValue || "").trim();
+    if (!raw) return 0;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds > 0)
+      return Math.min(seconds * 1000, RETRY_AFTER_MAX_MS);
+    const when = Date.parse(raw);
+    if (Number.isFinite(when)) {
+      const delta = when - Date.now();
+      if (delta > 0) return Math.min(delta, RETRY_AFTER_MAX_MS);
+    }
+    return 0;
   }
 
   async function fetchRetry(url, options = {}, retry = {}) {
@@ -96,11 +126,8 @@
         throw networkError;
       }
       if (RETRYABLE_STATUS.has(response.status) && attempt < attempts - 1) {
-        const retryAfter = Number(response.headers.get("Retry-After"));
-        const wait =
-          Number.isFinite(retryAfter) && retryAfter > 0
-            ? retryAfter * 1000
-            : backoffDelay(baseDelay, attempt);
+        const honored = parseRetryAfterMs(response.headers.get("Retry-After"));
+        const wait = honored > 0 ? honored : backoffDelay(baseDelay, attempt);
         // Drain the throttling-page body so the connection can be reused.
         try {
           await response.arrayBuffer();
@@ -271,11 +298,23 @@
       "/_api/web/GetFileByServerRelativePath(decodedurl='" +
       encodeURIComponent(odataString(serverRelativeUrl)) +
       "')/$value";
-    const response = await fetchRetry(endpoint, {
-      credentials: "include",
-      cache: "no-store",
-      headers: { Accept: "application/octet-stream" },
-    });
+    const readOnce = () =>
+      fetchRetry(endpoint, {
+        credentials: "include",
+        cache: "no-store",
+        headers: { Accept: "application/octet-stream" },
+      });
+    let response = await readOnce();
+    // Read-your-own-write race: addUsingPath just created this exact file, so a
+    // 404 here is almost never a durable not-found — it is the read-back racing
+    // SharePoint's own indexing/replication of the write. 404 is deliberately
+    // OUTSIDE RETRYABLE_STATUS (a genuine missing resource must fail fast), so
+    // give ONLY the read-back ONE short extra retry before surfacing. Transient
+    // throttling (429/503/etc.) is already absorbed inside fetchRetry.
+    if (response.status === 404) {
+      await sleep(1000);
+      response = await readOnce();
+    }
     if (!response.ok) {
       const text = await response.text();
       throw new Error(

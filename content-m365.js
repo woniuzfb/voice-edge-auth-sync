@@ -978,6 +978,13 @@
         // credentials:include -> 401). URLs are collected while parsing frames
         // and fetched once at terminal, off the answer path.
         const artifactUrls = new Set();
+        // 跨轮旧下载链接污染 + 挤掉新链接的根因隔离：M365 Chathub 的 type=2 终帧
+        // item.messages 携带【整段会话历史】(含前几轮 bot 消息及其 sourceAttributions /
+        // references 里的旧 asyncgw 对象 URL)。原先 collectArtifactsDeep 对整帧 JSON.stringify
+        // 正则抓取，会把所有历史链接一并收进 artifactUrls；轮次越多旧链接越多，harvest 后
+        // 既冒出大量旧链接，又会因同名产物在 background 侧被指纹去重而把当轮新链接挤掉。
+        // 对策：只信任【本轮】实时流经的 messageId 与权威 result，历史消息一律不采集。
+        const currentTurnMsgIds = new Set();
         let artifactsHarvested = false;
         // OBSERVATION-ONLY per-turn artifact-detection counters (gated by
         // window.__veM365Debug via dbg()). These NEVER touch artifactUrls or
@@ -1669,11 +1676,11 @@
           armIdleTimeout();
           const run = (s) => {
             for (const f of parseFrames(s)) {
-              // 每帧先做无死角 URL 扫描，保证 type=2/type=3 的 done() 读取
-              // artifactUrls.size 时，本帧携带的对象 URL 已全部入集（type=2 与
-              // type=3 常在同一 ws 消息内先后到达，循环里 type=2 先被扫，再轮到
-              // type=3 的 done()，时序正确）。
-              collectArtifactsDeep(f);
+              // 仅对【本轮实时流帧 type=1】做整帧深扫：type=1 只携带当轮流式消息，安全。
+              // type=2 终帧含整段会话历史，若在此整帧深扫会把历史旧链接一并收入，故改到下面
+              // 的 type===2 分支里按【本轮消息 + 权威 result】限定扫描。type=2 分支在同一
+              // for 循环内先于随后的 type=3 done() 执行，读取 artifactUrls.size 的时序仍正确。
+              if (f && f.type === 1) collectArtifactsDeep(f);
               if (!handshook) {
                 // 首个 {} 是握手 OK
                 handshook = true;
@@ -1710,10 +1717,16 @@
               if (f.type === 1 && f.target === "update") {
                 const a = (f.arguments && f.arguments[0]) || {};
                 const selectedMessageId = cursorMessageId(a.cursor);
-                if (selectedMessageId)
+                if (selectedMessageId) {
                   activeAnswerMessageId = selectedMessageId;
+                  currentTurnMsgIds.add(String(selectedMessageId));
+                }
                 if (Array.isArray(a.messages))
                   for (const message of a.messages) {
+                    // 记录本轮实时流经的每个 messageId(答案/进度/CoT 都属于当轮),供 type=2
+                    // 终帧按本轮范围过滤 item.messages,隔离历史旧消息携带的旧下载链接。
+                    if (message && message.messageId)
+                      currentTurnMsgIds.add(String(message.messageId));
                     const messageType = String(
                       message.messageType || "",
                     ).toLowerCase();
@@ -1803,17 +1816,24 @@
                 // ONLY on the authoritative type=2 result — its resolved
                 // sourceAttributions/references — with no preceding type=1
                 // snapshot carrying them (type=3 can follow type=2 in the same
-                // frame). collectArtifacts was previously called only in the
-                // type=1 update loop, so those turns finished with
-                // artifactUrls.size===0 -> artifactCount=0 -> background never
-                // held the terminal -> the SharePoint link block was silently
-                // dropped (links only, answer text unaffected). Scan the
-                // authoritative result/item/messages here too. artifactUrls is
-                // a Set, so this is idempotent with any type=1 hits — no dupes.
+                // frame). So we MUST scan the terminal here, but STRICTLY within
+                // the current turn:
+                //   - `result` 是本轮权威答案(其 sourceAttributions/references 已解析),
+                //     浅扫两字段 + 深扫整棵 result 子树即可拿到当轮对象 URL(不论落在哪个字段)。
+                //   - `item.messages` 携带【整段会话历史】——只扫 messageId ∈ currentTurnMsgIds
+                //     的本轮消息;历史旧消息(及其旧 asyncgw 对象 URL)一律跳过,根除跨轮污染与
+                //     "旧链接挤掉新链接"。此前无条件 collectArtifacts(item) + 遍历全部
+                //     item.messages 正是旧链接来源,已移除。
+                // artifactUrls 为 Set,与上面 type=1 的命中天然幂等去重。
                 collectArtifacts(result);
-                collectArtifacts(item);
+                collectArtifactsDeep(result);
                 if (Array.isArray(item.messages))
-                  for (const m of item.messages) collectArtifacts(m);
+                  for (const m of item.messages) {
+                    if (!m || !currentTurnMsgIds.has(String(m.messageId || "")))
+                      continue;
+                    collectArtifacts(m);
+                    collectArtifactsDeep(m);
+                  }
                 if (typeof result.message === "string" && result.message) {
                   // AUTHORITATIVE text with citations resolved. CAPTURE-VERIFIED
                   // : result.message carries ONLY the LAST answer segment,
