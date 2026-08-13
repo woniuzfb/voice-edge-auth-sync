@@ -2298,7 +2298,7 @@ function m365ArtifactTurn(id) {
       expected: null, // artifactCount from DONE; null until DONE seen
       settled: 0, // uploads/errors resolved for this id so far
       descriptors: [], // successful SharePoint descriptors (name/url/downloadUrl)
-      images: [], // {name, mimeType, dataUrl} 于 harvest 时同步记录，独立于 SP 上传
+      images: [], // {name, displayName, mimeType, dataUrl}，独立于 SP 上传
       artifactKeys: new Set(), // 同一产物可能被多个 WSS 消息/URL 重复 harvest；只消费一次
       bytes: 0, // 累计已观测 artifact 字节数，用于按大小动态计算持有窗口
       doneMessage: null, // the held terminal payload
@@ -2404,10 +2404,10 @@ function m365FinalizeArtifactTurn(id, reason) {
 
   // 1) 内联图片（data-URI）—— 独立于 SharePoint 是否成功；下方附带 SP 链接（若有）
   for (const img of state.images || []) {
-    const name = String(img.name || "").trim();
-    const cap = name || "image";
-    const d = name ? descByName.get(name) : null;
-    if (d) usedNames.add(name);
+    const storedName = String(img.name || "").trim();
+    const cap = String(img.displayName || storedName || "image").trim();
+    const d = storedName ? descByName.get(storedName) : null;
+    if (d) usedNames.add(storedName);
     const links = d
       ? [
           d.downloadUrl ? "[下载](" + d.downloadUrl + ")" : "",
@@ -2423,8 +2423,13 @@ function m365FinalizeArtifactTurn(id, reason) {
 
   // 2) 非内联产物（非图片，或超限回退）—— 保持原纯文本链接形式
   for (const d of state.descriptors) {
-    const name = String((d && d.name) || "").trim();
-    if (name && usedNames.has(name)) continue; // 已作为内联图片处理
+    const name = String((d && (d.displayName || d.name)) || "").trim();
+    const storedName = String((d && d.name) || "").trim();
+    if (
+      (name && usedNames.has(name)) ||
+      (storedName && usedNames.has(storedName))
+    )
+      continue; // 已作为内联图片处理
     const dl = d && d.downloadUrl ? "[下载链接](" + d.downloadUrl + ")" : "";
     const pl = d && d.url ? "[永久链接](" + d.url + ")" : "";
     const parts = [dl, pl].filter(Boolean).join(", ");
@@ -2716,6 +2721,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
       const track = M365_INJECT_ARTIFACT_LINKS && id;
       const file = {
         name: String(message.name || ""),
+        displayName: String(message.displayName || message.name || ""),
         data: String(message.data || ""),
         size: Number(message.size || 0),
         mimeType: String(message.mimeType || "application/octet-stream"),
@@ -2769,6 +2775,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
           const state = m365ArtifactTurn(id);
           state.images.push({
             name: file.name,
+            displayName: file.displayName || file.name,
             mimeType: file.mimeType,
             dataUrl: "data:" + file.mimeType + ";base64," + file.data,
           });
@@ -2785,7 +2792,14 @@ browser.runtime.onMessage.addListener((message, sender) => {
         // settled-counter below advances on both success and failure.
         const uploadPromise = uploadArtifactsToSharePoint([file])
           .then((uploaded) => {
-            const list = Array.isArray(uploaded) ? uploaded : [];
+            const list = (Array.isArray(uploaded) ? uploaded : []).map(
+              (descriptor) =>
+                descriptor && typeof descriptor === "object"
+                  ? Object.assign({}, descriptor, {
+                      displayName: file.displayName || file.name,
+                    })
+                  : descriptor,
+            );
             const info = list[0] || {};
             log(
               "M365 artifact uploaded to SharePoint:",

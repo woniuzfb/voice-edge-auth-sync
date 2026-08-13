@@ -978,6 +978,12 @@
         // credentials:include -> 401). URLs are collected while parsing frames
         // and fetched once at terminal, off the answer path.
         const artifactUrls = new Set();
+        // Preserve the display filename carried beside seeMoreUrl/targetLink.
+        // Some AMS links end at /views/original, so URL inference alone loses it.
+        const artifactNames = new Map();
+        // Exact model-authored labels from complete Markdown links in the
+        // current message's adaptive-card text, keyed by normalized AMS URL.
+        const artifactDisplayNames = new Map();
         // 跨轮旧下载链接污染 + 挤掉新链接的根因隔离：M365 Chathub 的 type=2 终帧
         // item.messages 携带【整段会话历史】(含前几轮 bot 消息及其 sourceAttributions /
         // references 里的旧 asyncgw 对象 URL)。原先 collectArtifactsDeep 对整帧 JSON.stringify
@@ -1042,26 +1048,76 @@
             value === false || String(value || "").toLowerCase() === "false"
           );
         };
+        const collectArtifactMarkdownLinks = (message) => {
+          if (!message || typeof message !== "object") return;
+          const cards = Array.isArray(message.adaptiveCards)
+            ? message.adaptiveCards
+            : [];
+          const visit = (value) => {
+            if (value == null) return;
+            if (typeof value === "string") {
+              const markdownLinkRe =
+                /\[([^\]\r\n]{1,500})\]\((https:\/\/[^)\s]+)\)/g;
+              let match;
+              while ((match = markdownLinkRe.exec(value))) {
+                const cleanUrl = cleanAmsUrl(match[2]);
+                const displayName = String(match[1] || "").trim();
+                if (
+                  cleanUrl &&
+                  displayName &&
+                  !artifactDisplayNames.has(cleanUrl)
+                )
+                  artifactDisplayNames.set(cleanUrl, displayName);
+              }
+              return;
+            }
+            if (Array.isArray(value)) {
+              for (const item of value) visit(item);
+              return;
+            }
+            if (typeof value !== "object") return;
+            for (const item of Object.values(value)) visit(item);
+          };
+          visit(cards);
+        };
         const collectArtifacts = (message) => {
           if (!message || typeof message !== "object") return;
-          const scan = (url) => {
-            const s = String(url || "");
-            if (AMS_OBJECT_RE.test(s)) {
-              const c = cleanAmsUrl(s);
-              if (c) artifactUrls.add(c);
+          collectArtifactMarkdownLinks(message);
+          const scan = (url, nameHint) => {
+            const rawUrl = String(url || "");
+            if (AMS_OBJECT_RE.test(rawUrl)) {
+              const cleanUrl = cleanAmsUrl(rawUrl);
+              if (cleanUrl) {
+                artifactUrls.add(cleanUrl);
+                const cleanName = sanitizeName(nameHint);
+                if (cleanName && !artifactNames.has(cleanUrl))
+                  artifactNames.set(cleanUrl, cleanName);
+              }
             }
           };
           const sa = message.sourceAttributions;
           if (Array.isArray(sa))
             for (const entry of sa)
               if (entry && !attributionIsExplicitlyExcluded(entry))
-                scan(entry.seeMoreUrl);
+                scan(
+                  entry.seeMoreUrl,
+                  entry.displayName ||
+                    entry.fileName ||
+                    entry.name ||
+                    entry.title,
+                );
           const refs = message.references;
           if (refs && typeof refs === "object")
             for (const k of Object.keys(refs)) {
               const entry = refs[k];
               if (entry && !attributionIsExplicitlyExcluded(entry))
-                scan(entry.targetLink);
+                scan(
+                  entry.targetLink,
+                  entry.displayName ||
+                    entry.fileName ||
+                    entry.name ||
+                    entry.title,
+                );
             }
         };
         // 无死角兜底：整帧扫描 asyncgw 对象 URL。collectArtifacts 只看两个固定
@@ -1304,7 +1360,7 @@
           if (hm && !/octet-stream/i.test(hm)) return hm;
           return "application/octet-stream";
         };
-        const harvestOne = async (url) => {
+        const harvestOne = async (url, nameHint, displayNameHint) => {
           // The AMS endpoint serves bytes at ".../views/original"; the captured
           // link often appends the display filename, and that longer path 404s.
           // Normalize the request target but keep `url` for name/logging.
@@ -1316,12 +1372,14 @@
           for (let i = 0; i < 12; i++) {
             const b64 = _amsBytes.get(fetchUrl);
             if (b64) {
-              const nm = artifactNameFromUrl(url, null);
+              const nm =
+                sanitizeName(nameHint) || artifactNameFromUrl(url, null);
               post({
                 type: "M365_ARTIFACT",
                 id,
                 url,
                 name: nm,
+                displayName: String(displayNameHint || "").trim() || nm,
                 size: (function () {
                   try {
                     return atob(b64).length;
@@ -1382,16 +1440,19 @@
               });
               if (res.ok) {
                 const buf = await res.arrayBuffer();
-                const nm = artifactNameFromUrl(
-                  url,
-                  res.headers.get("content-disposition"),
-                );
+                const nm =
+                  sanitizeName(nameHint) ||
+                  artifactNameFromUrl(
+                    url,
+                    res.headers.get("content-disposition"),
+                  );
                 const head = new Uint8Array(buf.slice(0, 16));
                 post({
                   type: "M365_ARTIFACT",
                   id,
                   url,
                   name: nm,
+                  displayName: String(displayNameHint || "").trim() || nm,
                   size: buf.byteLength,
                   mimeType: resolveMime(
                     head,
@@ -1437,7 +1498,12 @@
           if (artifactsHarvested) return;
           artifactsHarvested = true;
           if (!artifactUrls.size) return;
-          for (const url of artifactUrls) harvestOne(url);
+          for (const url of artifactUrls)
+            harvestOne(
+              url,
+              artifactNames.get(url) || "",
+              artifactDisplayNames.get(url) || "",
+            );
         };
         // ----------------------------------------------------------------
         let timeoutTimer = null;
