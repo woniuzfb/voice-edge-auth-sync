@@ -1410,6 +1410,45 @@
         let completionFallbackTimer = null;
         let type2ConversationId = "";
         let type2TurnState = "";
+        // Code Interpreter can remain legitimately busy while Chathub emits no
+        // user-visible answer text. Capture-verified execution markers are
+        // Progress messages with contentType="Code" and a non-empty hiddenText;
+        // GeneratedCode is the corresponding result. Keep this state strictly
+        // per turn and bounded so ordinary requests retain their normal idle
+        // protection.
+        const CODE_EXECUTING_PROGRESS_MS = 30000;
+        const CODE_EXECUTING_MAX_MS = 10 * 60 * 1000;
+        let codeExecutingTimer = null;
+        let codeExecutingDeadline = 0;
+        const leaveCodeExecuting = (reason) => {
+          if (codeExecutingTimer !== null) clearInterval(codeExecutingTimer);
+          if (codeExecutingDeadline)
+            dbg(
+              "CODE_EXECUTING leave id=%s reason=%s",
+              id,
+              reason || "unknown",
+            );
+          codeExecutingTimer = null;
+          codeExecutingDeadline = 0;
+        };
+        const enterCodeExecuting = (message) => {
+          if (terminal || codeExecutingTimer !== null) return;
+          codeExecutingDeadline = Date.now() + CODE_EXECUTING_MAX_MS;
+          dbg(
+            "CODE_EXECUTING enter id=%s messageId=%s",
+            id,
+            String((message && message.messageId) || ""),
+          );
+          // The triggering Progress frame is forwarded by the normal Progress
+          // branch below. Only synthesize later empty liveness signals.
+          codeExecutingTimer = setInterval(() => {
+            if (terminal || Date.now() >= codeExecutingDeadline) {
+              leaveCodeExecuting(terminal ? "terminal" : "bounded-timeout");
+              return;
+            }
+            post({ type: "M365_PROGRESS", id, text: "", codeExecuting: true });
+          }, CODE_EXECUTING_PROGRESS_MS);
+        };
         const cursorMessageId = (cursor) => {
           const path = String((cursor && cursor.j) || "");
           // Example: $['66f8...'].adaptiveCards[0].body[0].text
@@ -1430,6 +1469,7 @@
         const publishSnapshot = (candidate, source, messageId) => {
           const value = String(candidate || "");
           if (!value) return;
+          leaveCodeExecuting("answer-delta");
           // Route the snapshot to its segment first; a new messageId commits the
           // previous segment instead of being rejected as "non-prefix".
           ensureSegment(messageId);
@@ -1469,6 +1509,7 @@
         const publishCursorDelta = (delta) => {
           const value = String(delta || "");
           if (!value || !activeAnswerMessageId) return;
+          leaveCodeExecuting("cursor-delta");
           // writeAtCursor is only used as a low-latency fallback for servers
           // that stream *without* periodic cumulative snapshots. The moment a
           // single authoritative snapshot has been seen for this segment, the
@@ -1507,6 +1548,7 @@
         const done = (payload) => {
           if (terminal) return;
           terminal = true;
+          leaveCodeExecuting((payload && payload.type) || "terminal");
           try {
             dbg(
               "done id=%s type=%s convId=%s signal=%s authoritative=%s turnState=%s textLen=%d%s",
@@ -1623,10 +1665,12 @@
         // relay's content-based idle timeout, so the two layers do not overlap.
         // Python computes one size/count-aware budget from the original upload
         // metadata and sends it with M365_ASK. Clamp here so a malformed relay
-        // cannot disable the watchdog; older senders retain the 180s behavior.
+        // cannot disable the watchdog; older senders retain the relaxed 600s
+        // behavior. Keep the 30-minute ceiling aligned with Python's
+        // default M365_IDLE_MAX_SECONDS while still bounding malformed input.
         const IDLE_TIMEOUT_MS = Math.min(
-          900000,
-          Math.max(180000, Number(requestedIdleTimeoutMs) || 180000),
+          1800000,
+          Math.max(600000, Number(requestedIdleTimeoutMs) || 600000),
         );
         const armIdleTimeout = () => {
           if (terminal) return;
@@ -1739,6 +1783,13 @@
                     // harmless on progress messages, which carry none.
                     collectArtifacts(message);
                     if (messageType === "progress") {
+                      if (
+                        String(message.contentType || "").toLowerCase() ===
+                          "code" &&
+                        typeof message.hiddenText === "string" &&
+                        message.hiddenText.length > 0
+                      )
+                        enterCodeExecuting(message);
                       // Preserve protocol visibility without contaminating the
                       // append-only answer stream. The text is deliberately not
                       // interpreted, so localization/new wording is irrelevant.
@@ -1776,6 +1827,8 @@
                       }
                       continue;
                     }
+                    if (messageType === "generatedcode")
+                      leaveCodeExecuting("generated-code-result");
                     // Adopt the first genuine answer message even if the
                     // cursor frame has not arrived yet. Real answer messages
                     // carry an empty messageType and empty contentType; this
@@ -1810,6 +1863,7 @@
                 if (typeof a.writeAtCursor === "string")
                   publishCursorDelta(a.writeAtCursor);
               } else if (f.type === 2) {
+                leaveCodeExecuting("authoritative-result");
                 const item = f.item || {};
                 const result = (item && item.result) || {};
                 // Artifact download URLs (asyncgw/v1/objects/…) frequently live
