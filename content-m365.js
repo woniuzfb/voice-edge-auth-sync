@@ -1035,6 +1035,13 @@
         };
         const AMS_OBJECT_RE =
           /https:\/\/[^"'\s]*asyncgw[^"'\s]*\/v1\/objects\/[^"'\s]*/i;
+        const attributionIsExplicitlyExcluded = (entry) => {
+          if (!entry || typeof entry !== "object") return false;
+          const value = entry.isCitedInResponse;
+          return (
+            value === false || String(value || "").toLowerCase() === "false"
+          );
+        };
         const collectArtifacts = (message) => {
           if (!message || typeof message !== "object") return;
           const scan = (url) => {
@@ -1045,12 +1052,16 @@
             }
           };
           const sa = message.sourceAttributions;
-          if (Array.isArray(sa)) for (const s of sa) if (s) scan(s.seeMoreUrl);
+          if (Array.isArray(sa))
+            for (const entry of sa)
+              if (entry && !attributionIsExplicitlyExcluded(entry))
+                scan(entry.seeMoreUrl);
           const refs = message.references;
           if (refs && typeof refs === "object")
             for (const k of Object.keys(refs)) {
-              const r = refs[k];
-              if (r) scan(r.targetLink);
+              const entry = refs[k];
+              if (entry && !attributionIsExplicitlyExcluded(entry))
+                scan(entry.targetLink);
             }
         };
         // 无死角兜底：整帧扫描 asyncgw 对象 URL。collectArtifacts 只看两个固定
@@ -1064,9 +1075,32 @@
           /https:\/\/[^"'\s\\)\]]*asyncgw[^"'\s\\)\]]*\/v1\/objects\/[^"'\s\\)\]]*/gi;
         const collectArtifactsDeep = (frame) => {
           if (frame == null) return;
-          let s;
+          let s = "";
           try {
-            s = typeof frame === "string" ? frame : JSON.stringify(frame);
+            if (typeof frame === "string") {
+              s = frame;
+            } else {
+              const chunks = [];
+              const visit = (value) => {
+                if (value == null) return;
+                if (typeof value === "string") {
+                  chunks.push(value);
+                  return;
+                }
+                if (Array.isArray(value)) {
+                  for (const item of value) visit(item);
+                  return;
+                }
+                if (typeof value !== "object") return;
+                // A late type=1 snapshot can reuse this turn's messageId while
+                // appending CodeInterpreter attributions inherited from older turns.
+                // Captured frames mark those inherited entries as not cited.
+                if (attributionIsExplicitlyExcluded(value)) return;
+                for (const item of Object.values(value)) visit(item);
+              };
+              visit(frame);
+              s = chunks.join("\n");
+            }
           } catch (_) {
             return;
           }
@@ -1720,7 +1754,8 @@
           armIdleTimeout();
           const run = (s) => {
             for (const f of parseFrames(s)) {
-              // 仅对【本轮实时流帧 type=1】做整帧深扫：type=1 只携带当轮流式消息，安全。
+              // 对 type=1 做语义深扫；晚期快照可能在当前 messageId 下混入历史 attribution，
+              // collectArtifactsDeep 会跳过 isCitedInResponse=False 的继承项。
               // type=2 终帧含整段会话历史，若在此整帧深扫会把历史旧链接一并收入，故改到下面
               // 的 type===2 分支里按【本轮消息 + 权威 result】限定扫描。type=2 分支在同一
               // for 循环内先于随后的 type=3 done() 执行，读取 artifactUrls.size 的时序仍正确。
