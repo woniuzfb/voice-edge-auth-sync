@@ -2880,7 +2880,15 @@ browser.runtime.onMessage.addListener((message, sender) => {
       return;
     }
     if (message.type === "M365_PROGRESS") {
-      sendM365({ type: "M365_PROGRESS", id: message.id, text: "" });
+      sendM365({
+        type: "M365_PROGRESS",
+        id: message.id,
+        text: "",
+        codeExecuting: message.codeExecuting === true,
+        messageId: message.messageId,
+        contentType: message.contentType,
+        addToChainOfThought: message.addToChainOfThought === true,
+      });
       return;
     }
     if (message.type === "M365_REASONING") {

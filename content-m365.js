@@ -874,7 +874,28 @@
         let committed = "";
         let curId = "";
         let curBest = "";
+        // 当前段最新一帧【原始】累计快照。尾部稳定器可能扣住文末半个链接/引用，
+        // 终态(DONE)前用 curRaw 以 final 语义冲刷，保证 totalText 覆盖全部正文。
+        let curRaw = "";
+        // type-2 权威文本钉版失败（真改写，append-only 无法表示）时，无法表示的
+        // 余下部分。绝不整段覆盖 committed/curBest（覆盖会让 DONE.text 与已发正文
+        // 分叉 → Python non-prefix 丢弃 → 尾巴全丢）。改由 DONE 的带外 appendText
+        // 补发：Python 对 appendText 不做前缀校验、无条件下发——接缝处可能可见，
+        // 但一个字都不丢。
+        let divergedTail = "";
+        // 两个字符串的最长公共前缀长度。
+        const commonPrefixLen = (a, b) => {
+          const n = Math.min(a.length, b.length);
+          let i = 0;
+          while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+          return i;
+        };
         const totalText = () => committed + curBest;
+        // 终态文本：冲刷仍被暂存的尾部后再返回。光标通道(curRaw===curBest)下恒等。
+        const terminalText = () => {
+          const flushed = m365AdoptAnswer(curBest, curRaw || curBest, true);
+          return committed + (flushed === null ? curBest : flushed);
+        };
         // Chain-of-thought accumulator — MIRRORS the answer accumulator above,
         // but on the reasoning channel. The model's real reasoning is delivered
         // as Progress frames flagged addToChainOfThought:true, cumulative per
@@ -957,6 +978,7 @@
             committed += curBest;
             if (curSegHadInvocation) committed += TOOL_STEP_SEPARATOR;
             curBest = "";
+            curRaw = ""; // raw snapshot is per segment too
             curId = mid;
             sawSnapshot = false; // snapshot-vs-writeAtCursor is per segment
             curSegHadInvocation = false; // tool-call flag is per segment
@@ -1023,6 +1045,48 @@
         };
         const ARTSCAN_MISSED_CAP = 6;
         const ARTSCAN_SNIPPET_LEN = 160;
+        // —— AdaptiveCard 内联图采集：ImageGeneration 等插件把产物图直接以
+        //    data-URI 放在 messages[].adaptiveCards 的 ImageSet/Image 元素里
+        //    （抓包实证：data-URI 只在 adaptiveCards[0].body[0].images[0].url，
+        //    text 快照里没有、asyncgw 产物 URL 也没有）——artifact 抓取通道覆盖
+        //    不到，不收就是"内联图一直中断"：正文到齐、图永远不来。随 DONE 走
+        //    带外 appendText（与产物图同路径），Python 不做前缀校验、无条件补发。
+        //    跨帧/跨 type-2 重复出现按内容指纹去重；超过内联上限跳过并记 dbg。——
+        const INLINE_CARD_IMAGE_MAX_B64 = 3 * 1024 * 1024;
+        const inlineCardImages = new Map(); // 内容指纹 -> {url, alt}
+        const collectInlineCardImages = (message) => {
+          if (!message || typeof message !== "object") return;
+          const cards = message.adaptiveCards;
+          if (!Array.isArray(cards) || !cards.length) return;
+          const visit = (v) => {
+            if (!v || typeof v !== "object") return;
+            if (Array.isArray(v)) {
+              for (const item of v) visit(item);
+              return;
+            }
+            const url = typeof v.url === "string" ? v.url : "";
+            if (/^data:image\//i.test(url)) {
+              if (url.length <= INLINE_CARD_IMAGE_MAX_B64) {
+                const fp =
+                  url.length + "" + url.slice(0, 96) + "" + url.slice(-96);
+                if (!inlineCardImages.has(fp))
+                  inlineCardImages.set(fp, {
+                    url,
+                    alt: String(v.altText || v.title || "")
+                      .replace(/[\[\]\n\r]+/g, " ")
+                      .trim(),
+                  });
+              } else {
+                dbg(
+                  "[inline-card-image] too large, skipped b64=%d",
+                  url.length,
+                );
+              }
+            }
+            for (const item of Object.values(v)) visit(item);
+          };
+          visit(cards);
+        };
         // Sanitize a captured AMS object URL before it enters artifactUrls.
         // Two failure modes were observed when a URL appeared in the ANSWER
         // PROSE rather than a citation field (e.g. the model literally writing
@@ -1555,49 +1619,262 @@
           const match = /^\$\[['"]([^'"]+)['"]\]/.exec(path);
           return match ? match[1] : "";
         };
-        // Citation-form normalizer. The server first streams an UNRESOLVED
-        // placeholder (e.g. 【1-turn1file1】) and later REWRITES it IN PLACE to
-        // the resolved private-use form \ue200cite\ue202…\ue201. Both encode the
-        // same citation, so we collapse either span to one neutral token before
-        // any prefix comparison. This lets an in-place citation rewrite be seen
-        // as forward progress instead of a token retraction.
-        const CITE_TOKEN = "\ue200\ue201";
-        const stripCites = (s) =>
-          String(s)
-            .replace(/\ue200[\s\S]*?\ue201/g, CITE_TOKEN) // resolved cite span
-            .replace(/【\d+-[^】]*】/g, CITE_TOKEN); // unresolved placeholder
-        const publishSnapshot = (candidate, source, messageId) => {
+        /* VE-M365-STREAM-CORE-BEGIN */
+        // —— 流式正文稳定器（纯函数块；
+        //    按标记原样抽取本块执行，因此本块【禁止】引用 DOM / window / post /
+        //    闭包变量）——
+        //
+        // 根因：M365 会把已输出的下载链接 / citation 在原地改写（临时 URL→正式
+        // URL、【N-x】→\ue200…\ue201）。旧逻辑先发出 "- [下载" 这类不稳定前缀，
+        // 改写发生后新快照不再满足 startsWith 前缀检查 → 后续帧全部被判
+        // non-prefix 丢弃（卡在第一个下载链接）；终态 result.message 与已发字节
+        // 冲突 → Python 判 non-prefix 丢弃（吞掉后续正文）。
+        //
+        // 对策（两条正交规则）：
+        //   1) 尾部稳定器 m365StablePrefixEnd：快照结尾落在【未完成】链接/引用
+        //      构造内部时，只发布到构造起点之前；构造闭合（或被换行/非常规字符
+        //      证明不是协议构造）后一次性放行。绝不先发出半个链接。
+        //   2) 归一 + 钉版 m365AdoptAnswer：完整的 \ue200…\ue201、【N-x】、
+        //      <cite>…</cite> 与 AMS(asyncgw /v1/objects/) 链接是"内容可被
+        //      服务器原地改写"的易失跨度；前缀比较前先把它们折成固定 token，
+        //      若归一后仍是前缀扩展，则【保留已发布字节】（钉版，已发正文永不
+        //      回退），只追加真正的新后缀。
+        // 反引号代码范围（含未闭合尾段）完全绕过：代码里的链接形状是可见文字。
+        const M365_VOLATILE_TOKEN = "\ue000"; // 每个易失跨度在 norm 空间折成 1 字符
+        // 完整易失跨度（只在代码范围外归一）。顺序即优先级：链接先于裸 URL。
+        // 三种引用编码都限定单行：它们是服务器下发的原子 token，永不跨行；
+        // 不这么限，散文里一个孤零零的 "【1-" 会和几百字符之后真正的 【N-x】
+        // 被匹配成一个巨型跨度，归一结果在不同帧间不一致（= 吞正文的另一种形态）。
+        const M365_VOLATILE_RE = new RegExp(
+          [
+            "\\ue200[^\\ue201\\n]*\\ue201", // 已解析 citation（单行原子 token）
+            "【\\d+-[^】\\n]*】", // 未解析 citation 占位符（单行；不误伤【重要】）
+            "<cite\\b[^\\n>]*>[A-Za-z0-9][A-Za-z0-9_:\\-]*</cite>", // <cite> 形态
+            "!?\\[[^\\]\\n]*\\]\\(https?:\\/\\/[^\\s)]*asyncgw[^\\s)]*\\/v1\\/objects\\/[^\\s)]*\\)", // AMS 链接
+            "https?:\\/\\/[^\\s\"'()[\\]]*asyncgw[^\\s\"'()[\\]]*\\/v1\\/objects\\/[^\\s\"'()[\\]]*", // 裸 AMS URL
+          ].join("|"),
+          "gi",
+        );
+        // 文末"未完成构造"扣留规则。所有分支都不跨换行（换行即证明是字面文本），
+        // 且排除反引号（反引号出现即进入/离开代码，链接候选自然解除）。
+        //   - 半图片 ![：URL 用宽字符集（除 ) / 换行 / 反引号外都收）——CJK 路径的
+        //     attachment:/sandbox: 宿主图也必须扣到闭合，届时 Python ④ 同宽删除；
+        //     窄字符集会提前放行半个 CJK URL、Python 删完整跨度时造成回退。
+        //   - 半链接 [：经 ]( 到 URL 未闭合；【刚闭合的 "]" 也算未证明】——下一字符
+        //     可能是 "("（M365 会在此窗口内原地改写文件名/URL）。URL 只收 ASCII
+        //     字符集，出现空白/CJK/全角标点即放行（普通未闭合链接照常可见）。
+        //   - 半引用占位：【 / 【N / 【N-x（【中文 不算，同 Python 规则）。
+        //   - 半 <cite>：开标签、REFID、半闭标签各阶段，以及 "<"…"<cit" 成形中。
+        const M365_TAIL_HOLD_RE = new RegExp(
+          [
+            "!\\[[^\\]\\n`]*(?:\\](?:\\([^)\\n`]*)?)?$",
+            "\\[[^\\]\\n`]*(?:\\](?:\\([A-Za-z0-9\\-._~:/?#@!$&'*+,;=%]*)?)?$",
+            "【(?:\\d+-?[^】\\n`]*)?$",
+            "<cite\\b[^\\n>`]*(?:>[A-Za-z0-9_:\\-]*(?:<\\/?[a-z]*)?)?$",
+            "<(?:c(?:i(?:t(?:e)?)?)?)?$",
+          ].join("|"),
+          "i",
+        );
+        // 反引号跨度，与 Python _m365_code_intervals 使用相同的等长分隔符规则。
+        // 已闭合跨度原样保护；文末未闭合跨度另行返回 opener 位置与长度，由稳定器
+        // 按【围栏/行内】分别决定扣留策略。
+        function m365CodeState(s) {
+          const spans = [];
+          let openStart = -1;
+          let openLen = 0;
+          const re = /`+/g;
+          let m;
+          while ((m = re.exec(s))) {
+            if (openStart < 0) {
+              openStart = m.index;
+              openLen = m[0].length;
+            } else if (m[0].length === openLen) {
+              spans.push([openStart, m.index + m[0].length]);
+              openStart = -1;
+              openLen = 0;
+            }
+          }
+          return { spans, unclosedStart: openStart, unclosedLen: openLen };
+        }
+        // 围栏 opener 判定：分隔符长度 ≥3 且位于行行首（至多 3 空格缩进）。
+        // 行中间的 ``` 不可能是围栏——它只是行内代码或字面文本。
+        function m365IsFenceOpener(s, start, len) {
+          if (len < 3) return false;
+          const lineStart = s.lastIndexOf("\n", start - 1) + 1;
+          return /^ {0,3}$/.test(s.slice(lineStart, start));
+        }
+        // 行内未闭合代码的扣留窗口：只在【同一行且够短】时扣留。抓包实证的
+        // 原地改写（`[普通 → `https://…）发生在 opener 之后几个字符内，这个
+        // 窗口足以覆盖；而符号清单/散文里永不配对的孤立反引号，换行或超过
+        // 窗口即按字面文本放行——不再把其后全部正文扣到 DONE
+        // (正文被一个行内 ``` 扣到终态）。放行是安全的：已发字节不回退，
+        // 闭合符到达时同样按字面文本继续发布。
+        const M365_INLINE_UNCLOSED_HOLD_MAX = 120;
+        // 未闭合尾段是否按"代码"对待（扣留 + 归一保护）：围栏 opener 始终算
+        // 代码；行内 opener 只在同行且够短的窗口内算代码，否则是孤立反引号
+        // 字面文本。归一化与扣留共用同一判定是安全的：归一折叠只影响比较、
+        // 从不改变已发字节——放行区里的引用占位符会被折成易失 token，服务器
+        // 原地解析时钉版比较相容（不二次冻结）。注意 Python 清洗层【刻意】不
+        // 跟随本判定：它做真实删除，未闭合跨度必须恒按代码保护，否则闭合符
+        // 到达时内容恢复会造成前缀回退 ——JS 发布只增不删，不受此限。
+        function m365HoldAsCode(s, state) {
+          if (state.unclosedStart < 0) return false;
+          if (m365IsFenceOpener(s, state.unclosedStart, state.unclosedLen))
+            return true;
+          const span = s.slice(state.unclosedStart);
+          return (
+            !span.includes("\n") && span.length <= M365_INLINE_UNCLOSED_HOLD_MAX
+          );
+        }
+        function m365CodeSpans(s) {
+          const state = m365CodeState(s);
+          return m365HoldAsCode(s, state)
+            ? state.spans.concat([[state.unclosedStart, s.length]])
+            : state.spans;
+        }
+        function m365InSpans(spans, pos) {
+          for (let i = 0; i < spans.length; i++)
+            if (pos >= spans[i][0] && pos < spans[i][1]) return true;
+          return false;
+        }
+        // 归一：把易失跨度折成 token。返回 { norm, segs }；segs 记录 norm→raw
+        // 分段映射（raw 段 nl===rl；token 段 nl===1），供钉版合并定位。
+        function m365NormalizeVolatile(s) {
+          const code = m365CodeSpans(s);
+          const segs = [];
+          let norm = "";
+          let cursor = 0;
+          M365_VOLATILE_RE.lastIndex = 0;
+          let m;
+          while ((m = M365_VOLATILE_RE.exec(s))) {
+            if (m.index < cursor) continue; // 与上一 token 重叠（防御，理论不会）
+            if (m365InSpans(code, m.index)) continue; // 代码范围内原样保留
+            if (m.index > cursor)
+              (segs.push({
+                n: norm.length,
+                r: cursor,
+                nl: m.index - cursor,
+                rl: m.index - cursor,
+              }),
+                (norm += s.slice(cursor, m.index)));
+            segs.push({ n: norm.length, r: m.index, nl: 1, rl: m[0].length });
+            norm += M365_VOLATILE_TOKEN;
+            cursor = m.index + m[0].length;
+            M365_VOLATILE_RE.lastIndex = cursor;
+          }
+          if (s.length > cursor)
+            (segs.push({
+              n: norm.length,
+              r: cursor,
+              nl: s.length - cursor,
+              rl: s.length - cursor,
+            }),
+              (norm += s.slice(cursor)));
+          return { norm: norm, segs: segs };
+        }
+        // 把 norm 偏移（恰好是 published 的归一长度）映射回 cand 的 raw 偏移。
+        // 前缀对齐保证落点只会是 raw 段内部或 token 段边界，绝不在 token 中间。
+        function m365MapNormToRaw(segs, n) {
+          for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            if (n > seg.n + seg.nl) continue;
+            if (seg.nl === seg.rl) return seg.r + (n - seg.n);
+            return n === seg.n + seg.nl ? seg.r + seg.rl : seg.r;
+          }
+          return segs.length
+            ? segs[segs.length - 1].r + segs[segs.length - 1].rl
+            : 0;
+        }
+        // 尾部稳定器：返回"可立即发布"的稳定前缀长度。只扣当前文末的未完成
+        // 构造；一旦后续字符证明它不是链接/引用（换行、CJK、非常规字符），
+        // 下一帧自然放行。代码范围不扣。
+        function m365StablePrefixEnd(s) {
+          const codeState = m365CodeState(s);
+          let cut = s.length;
+          let code = codeState.spans;
+          if (m365HoldAsCode(s, codeState)) {
+            // M365 may rewrite an unfinished code span in place before the
+            // matching closing backticks arrive. Never publish that unstable
+            // tail early. (围栏：扣到闭合/DONE；行内：仅同行短窗口。)
+            cut = codeState.unclosedStart;
+            code = code.concat([[codeState.unclosedStart, s.length]]);
+          }
+          // 否则：文末是孤立反引号（符号清单/散文里永不配对的那种），按字面
+          // 文本放行——不扣留，也不再当代码保护。
+          // 半个 \ue200…（未见 \ue201；引用编码恒为单行——先出现换行即放行，
+          // 避免散文里一个游离 \ue200 把正文永久扣到 DONE）
+          const e = s.lastIndexOf("\ue200");
+          if (
+            e >= 0 &&
+            !m365InSpans(code, e) &&
+            s.indexOf("\ue201", e) < 0 &&
+            s.indexOf("\n", e) < 0
+          )
+            cut = e;
+          // 半链接/半【/半<cite> 都不跨换行：只看全文最后一行
+          const lineStart = s.lastIndexOf("\n") + 1;
+          const m = M365_TAIL_HOLD_RE.exec(s.slice(lineStart));
+          if (m) {
+            const idx = lineStart + m.index;
+            if (!m365InSpans(code, idx) && idx < cut) cut = idx;
+          }
+          return cut;
+        }
+        // 归一 + 钉版采纳。published = 已发布（钉版）文本；incoming = 新累计
+        // 快照；isFinal=true 跳过尾部稳定器（终态必须放出全部）。返回新的已
+        // 发布文本；真正的 non-prefix 改写返回 null（调用方告警并跳过）。
+        //
+        // 三条路径：
+        //   A) raw 仍以 published 开头（纯增长，占绝大多数）：发布稳定前缀；
+        //      若扣留点落在已发布区域之内（例如已发出的 "[标签]" 又长出了 "("），
+        //      只扣住已发布点之后的部分，本帧无可发布增量时原样返回。
+        //   B) raw 不再以 published 开头（原地改写疑似）：完整易失跨度归一成
+        //      token 后比较；归一后仍是前缀扩展 → 钉版合并：已发字节原样保留，
+        //      只追加归一对齐点之后的真正新后缀。
+        //   C) 归一后仍非前缀扩展 → null（真正的回撤/改写，append-only 无法表示）。
+        function m365AdoptAnswer(published, incoming, isFinal) {
+          const raw = String(incoming || "");
+          const end = isFinal ? raw.length : m365StablePrefixEnd(raw);
+          if (raw.startsWith(published))
+            return end >= published.length ? raw.slice(0, end) : published;
+          const cand = raw.slice(0, end);
+          const np = m365NormalizeVolatile(published);
+          const nc = m365NormalizeVolatile(cand);
+          if (!nc.norm.startsWith(np.norm)) {
+            // 归一后【更短】的帧 = 改写边界处的陈旧帧（token 长度差），无新内容，
+            // 不是分歧：原样返回已发布文本，不产生告警。
+            if (np.norm.startsWith(nc.norm)) return published;
+            return null;
+          }
+          const cut = m365MapNormToRaw(nc.segs, np.norm.length);
+          return published + cand.slice(cut);
+        }
+        /* VE-M365-STREAM-CORE-END */
+        const publishSnapshot = (candidate, source, messageId, isFinal) => {
+          // 快照文本是累计的。产物 URL、未完成链接和代码示例可能共享同一前缀，
+          // 因此这里不解析/截断 Markdown：稳定器只扣文末半个构造；完整易失跨度
+          // 由 m365AdoptAnswer 归一比较、原地改写时钉版续传。产物抓取走元数据，
+          // 与可见正文路径完全独立。
           const value = String(candidate || "");
           if (!value) return;
           leaveCodeExecuting("answer-delta");
           // Route the snapshot to its segment first; a new messageId commits the
           // previous segment instead of being rejected as "non-prefix".
           ensureSegment(messageId);
-          if (value === curBest) return;
-          // Within the current segment the answer is append-only. A stale/short
-          // or non-prefix rewrite of the SAME segment cannot be represented
-          // without retracting tokens, so it is ignored — but this guard is now
-          // scoped to curBest, never to text from an earlier segment.
-          if (!value.startsWith(curBest)) {
-            // Citation-aware retry: the divergence may be nothing more than the
-            // server resolving 【1-xxxx】 into the \ue200cite\ue202…\ue201 form
-            // at a position already inside curBest. With citation spans
-            // neutralized, a genuine append still shows the current segment as a
-            // prefix; if it does, this is a citation resolution (real forward
-            // progress, no tokens retracted) and we adopt the newer, resolved
-            // value. Only a normalized non-prefix is a true retraction/rewrite
-            // that append-only cannot represent, so only that is dropped.
-            if (!stripCites(value).startsWith(stripCites(curBest))) {
-              console.warn("[VE-m365] ignored non-prefix answer snapshot", {
-                source,
-                messageId: curId,
-                currentSegmentLength: curBest.length,
-                incomingLength: value.length,
-              });
-              return;
-            }
+          curRaw = value;
+          const next = m365AdoptAnswer(curBest, value, isFinal === true);
+          if (next === null) {
+            // 归一后仍非前缀扩展 = 真正的回撤/改写，append-only 无法表示，丢弃。
+            console.warn("[VE-m365] ignored non-prefix answer snapshot", {
+              source,
+              messageId: curId,
+              currentSegmentLength: curBest.length,
+              incomingLength: value.length,
+            });
+            return;
           }
-          curBest = value;
+          if (next === curBest) return; // 仅尾部被暂存，没有可发布增量
+          curBest = next;
           sawSnapshot = true;
           post({
             type: "M365_DELTA",
@@ -1619,7 +1896,14 @@
           // snapshots that follow are rejected by the prefix guard.
           ensureSegment(activeAnswerMessageId);
           if (sawSnapshot) return;
-          curBest += value;
+          // 光标通道同样过稳定器：增量先拼成累计原始文本，按与快照相同的规则
+          // 扣留文末半个链接/引用/未闭合代码段。否则未闭合代码被原地改写时
+          // （抓包实证：`[普通 → `https://…）光标通道会把不稳定前缀直接发出，
+          // 终态 result.message 钉版分叉 → Python non-prefix 吞掉全部尾巴。
+          curRaw += value;
+          const next = m365AdoptAnswer(curBest, curRaw, false);
+          if (next === null || next === curBest) return; // 仅尾部被暂存
+          curBest = next;
           post({
             type: "M365_DELTA",
             id,
@@ -1681,6 +1965,31 @@
           try {
             if (payload && payload.type === "M365_DONE") {
               payload.artifactCount = artifactUrls.size;
+              // type-2 钉版失败的余下部分：带外补发（Python 对 appendText 不做
+              // 前缀校验）。background 的产物链接块会【追加】在其后，不覆盖。
+              if (divergedTail)
+                payload.appendText =
+                  String(payload.appendText || "") + divergedTail;
+              // AdaptiveCard 内联图（ImageGeneration 等插件的 data-URI 产物）：
+              // 字节已在手，无需 harvest/上传，直接作为图片 markdown 块带外下发。
+              // 不计入 artifactCount——没有可结算的外部产物，持有 DONE 只会白等。
+              if (inlineCardImages.size) {
+                const blocks = [];
+                for (const img of inlineCardImages.values())
+                  blocks.push(
+                    "![" + (img.alt || "生成的图片") + "](" + img.url + ")",
+                  );
+                payload.appendText =
+                  String(payload.appendText || "") +
+                  "\n\n" +
+                  blocks.join("\n\n");
+                dbg(
+                  "[inline-card-image] deliver id=%s images=%d appendLen=%d",
+                  id,
+                  inlineCardImages.size,
+                  payload.appendText.length,
+                );
+              }
               // Ride the per-turn artScan counters ON the DONE payload so they
               // reach the PYTHON [relay-artifact] log (via background
               // m365ForwardToPy) — no page console needed. Diagnostic only;
@@ -1793,7 +2102,7 @@
           done({
             type: "M365_DONE",
             id,
-            text: totalText(),
+            text: terminalText(),
             conversationId: type2ConversationId || convId,
             completionSignal: "type2-completed",
             authoritative: true,
@@ -1883,6 +2192,9 @@
                     // URLs (sourceAttributions.seeMoreUrl / references.targetLink);
                     // harmless on progress messages, which carry none.
                     collectArtifacts(message);
+                    // AdaptiveCard 内联图（ImageGeneration 等插件的 data-URI
+                    // 产物图）——text/artifact 通道都覆盖不到，必须单独采集。
+                    collectInlineCardImages(message);
                     if (messageType === "progress") {
                       if (
                         String(message.contentType || "").toLowerCase() ===
@@ -1988,6 +2300,8 @@
                       continue;
                     collectArtifacts(m);
                     collectArtifactsDeep(m);
+                    // 内联图也按本轮范围采集（终帧可能首次携带卡片；指纹去重）
+                    collectInlineCardImages(m);
                   }
                 if (typeof result.message === "string" && result.message) {
                   // AUTHORITATIVE text with citations resolved. CAPTURE-VERIFIED
@@ -2004,24 +2318,64 @@
                   //
                   // Reconcile instead of overwrite: result.message is the resolved
                   // form of the CURRENT segment. Keep the already-committed prior
-                  // segments and adopt result.message as curBest. stripCites lets a
-                  // pure citation resolution (【1-xxxx】 → \ue200cite…\ue201) of the
-                  // current segment still be recognized, and the whole-turn case
-                  // (result.message already spans committed) still adopts wholesale.
+                  // segments and adopt result.message as curBest. The volatile-span
+                  // normalizer lets a pure in-place rewrite (citation resolution
+                  // 【1-xxxx】 → \ue200cite…\ue201, temp→final artifact URL) of the
+                  // current segment still be recognized via pin-merge, and the
+                  // whole-turn case (result.message already spans committed) still
+                  // adopts wholesale — WITHOUT regressing already-streamed bytes.
                   if (
                     committed &&
-                    !stripCites(result.message).startsWith(
-                      stripCites(committed),
+                    !m365NormalizeVolatile(result.message).norm.startsWith(
+                      m365NormalizeVolatile(committed).norm,
                     )
                   ) {
                     // Multi-segment: result.message == authoritative CURRENT segment
                     // only. Preserve prior segments (committed), refresh curBest.
-                    curBest = result.message;
+                    const seg = m365AdoptAnswer(curBest, result.message, true);
+                    if (seg === null) {
+                      console.warn(
+                        "[VE-m365] type2 segment snapshot diverged",
+                        {
+                          currentSegmentLength: curBest.length,
+                          incomingLength: result.message.length,
+                        },
+                      );
+                      // 保留已发正文；无法表示的余下部分走带外补发（见上）。
+                      divergedTail = result.message.slice(
+                        commonPrefixLen(curBest, result.message),
+                      );
+                    } else {
+                      curBest = seg;
+                    }
+                    curRaw = result.message;
                   } else {
                     // Single-segment turn, or result.message already spans the whole
-                    // answer: adopt wholesale (original citation-resolution fix).
-                    committed = result.message;
+                    // answer: adopt wholesale through the same pin-merge (a raw
+                    // overwrite is exactly what used to break the relay prefix
+                    // when a link/citation had been rewritten in place mid-turn).
+                    const merged = m365AdoptAnswer(
+                      totalText(),
+                      result.message,
+                      true,
+                    );
+                    if (merged === null) {
+                      console.warn(
+                        "[VE-m365] type2 whole-turn snapshot diverged",
+                        {
+                          currentLength: totalText().length,
+                          incomingLength: result.message.length,
+                        },
+                      );
+                      // 保留已发正文；无法表示的余下部分走带外补发（见上）。
+                      divergedTail = result.message.slice(
+                        commonPrefixLen(totalText(), result.message),
+                      );
+                    } else {
+                      committed = merged;
+                    }
                     curBest = "";
+                    curRaw = "";
                   }
                   sawSnapshot = true;
                   post({
@@ -2033,12 +2387,14 @@
                 } else {
                   // No authoritative result.message this turn; fall back to the
                   // per-messageId text via the (now citation-aware) snapshot path.
+                  // Final semantics: flush any still-held tail construct.
                   const finalText = finalTextFromType2(item);
                   if (finalText)
                     publishSnapshot(
                       finalText,
                       "type2-final",
                       activeAnswerMessageId,
+                      true,
                     );
                 }
                 type2ConversationId = item.conversationId || convId;
@@ -2064,7 +2420,7 @@
                   done({
                     type: "M365_DONE",
                     id,
-                    text: totalText(),
+                    text: terminalText(),
                     conversationId: type2ConversationId || convId,
                     completionSignal: "signalr-type-3",
                     authoritative: true,
