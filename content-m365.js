@@ -1596,8 +1596,12 @@
           codeExecutingDeadline = 0;
         };
         const enterCodeExecuting = (message) => {
-          if (terminal || codeExecutingTimer !== null) return;
+          if (terminal) return;
+          // Every genuine upstream Code Interpreter progress frame renews the
+          // execution lease. Previously an existing timer returned before this
+          // assignment, so the lease expired relative to the first frame.
           codeExecutingDeadline = Date.now() + CODE_EXECUTING_MAX_MS;
+          if (codeExecutingTimer !== null) return;
           dbg(
             "CODE_EXECUTING enter id=%s messageId=%s",
             id,
@@ -1607,7 +1611,7 @@
           // branch below. Only synthesize later empty liveness signals.
           codeExecutingTimer = setInterval(() => {
             if (terminal || Date.now() >= codeExecutingDeadline) {
-              leaveCodeExecuting(terminal ? "terminal" : "bounded-timeout");
+              leaveCodeExecuting(terminal ? "terminal" : "lease-expired");
               return;
             }
             post({ type: "M365_PROGRESS", id, text: "", codeExecuting: true });
