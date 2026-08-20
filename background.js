@@ -1119,7 +1119,7 @@ setTimeout(() => requestBrowserState(true), 800);
 /* =========================================================================
  * Voice Edge · M365 background — OAuth broker, entry settings, frame routing
  * ========================================================================= */
-const M365_BRIDGE_URL = "ws://127.0.0.1:5002/ws";
+const M365_BRIDGE_URL = "ws://127.0.0.1:5003/ws";
 const M365_AUTH_KEY = "voiceEdgeM365AuthV1";
 const M365_SETTINGS_KEY = "voiceEdgeM365SettingsV1";
 const M365_SYDNEY_SCOPE = "https://substrate.office.com/sydney/.default";

@@ -1,12 +1,15 @@
 {
   "manifest_version": 2,
   "name": "Voice Edge Auth Sync",
-  "version": "1.7.1",
+  "version": "1.7.3",
   "description": "Syncs browser authentication and conversation state for Voice Edge, including M365 Copilot Chathub.",
   "browser_specific_settings": {
     "gecko": {
       "id": "voice-edge-auth-sync@local",
-      "strict_min_version": "115.0"
+      "strict_min_version": "115.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
     }
   },
   "permissions": [
