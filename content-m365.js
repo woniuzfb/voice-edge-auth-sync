@@ -500,6 +500,9 @@
           String(d.conversationId || ""),
           Array.isArray(d.attachments) ? d.attachments : [],
           Number(d.idleTimeoutMs || 0),
+          d.agentConfig && typeof d.agentConfig === "object"
+            ? d.agentConfig
+            : {},
         );
       } else if (d.type === "M365_STOP") {
         // Abort the in-flight turn for this id (client interrupted the request).
@@ -513,8 +516,18 @@
     });
 
     // ---- 自建 Chathub WSS,发一轮,读流 ----
-    function buildChatArgs(text, tone, conversationId, attachments = []) {
+    function buildChatArgs(
+      text,
+      tone,
+      conversationId,
+      attachments = [],
+      agentConfig = {},
+    ) {
       const rid = uuid();
+      const agentId = String(agentConfig.id || "");
+      const agentSource = String(agentConfig.source || "");
+      const isConfiguredAgent = Boolean(agentId && agentSource);
+      const configuredGpt = { id: agentId, source: agentSource };
       // FileUrl（ODB 文档）—— 这条会触发 officeweb 分支
       const fileUrlAnnotations = attachments
         .filter(
@@ -531,6 +544,29 @@
           text: String(file.name),
           url: String(file.url),
           messageAnnotationType: "FileUrl",
+        }));
+      // Python-configured Declarative Agents use the native SPO File annotation
+      // observed in browser payloads, not the generic FileUrl/officeweb shape.
+      const agentFileAnnotations = attachments
+        .filter(
+          (file) =>
+            file &&
+            file.name &&
+            file.url &&
+            file.verified === true &&
+            file.agentFileId,
+        )
+        .map((file) => ({
+          id: String(file.agentFileId),
+          text: String(file.name),
+          messageAnnotationMetadata: {
+            "@type": "File",
+            fileType: String(
+              file.fileType || String(file.name).split(".").pop() || "",
+            ).toLowerCase(),
+          },
+          url: String(file.url),
+          messageAnnotationType: "File",
         }));
       // ImageFile（图片 blob）—— 只需已拿到 docId；保持 owahub 默认帧
       const imageAnnotations = attachments
@@ -552,7 +588,9 @@
             messageAnnotationType: "ImageFile",
           };
         });
-      const messageAnnotations = [...fileUrlAnnotations, ...imageAnnotations];
+      const messageAnnotations = isConfiguredAgent
+        ? [...agentFileAnnotations, ...imageAnnotations]
+        : [...fileUrlAnnotations, ...imageAnnotations];
       // 关键：只有 FileUrl 才切 officeweb；纯图片留在 owahub 默认分支。
       const hasAttachments = fileUrlAnnotations.length > 0;
       const capturedAttachmentOptionsSets = [
@@ -695,10 +733,13 @@
             "SwitchRespondingEndpoint",
           ],
           sliceIds: [],
-          threadLevelGptId: {},
+          threadLevelGptId: isConfiguredAgent ? configuredGpt : {},
           traceId: rid,
           isStartOfSession: false,
-          clientInfo: hasAttachments ? officeClientInfo : owaClientInfo,
+          clientInfo:
+            isConfiguredAgent || !hasAttachments
+              ? owaClientInfo
+              : officeClientInfo,
           message: {
             author: "user",
             inputMethod: "Keyboard",
@@ -719,33 +760,41 @@
             clientPreferences: hasAttachments
               ? {}
               : { executionControls: { web: {}, work: {} } },
-            ...(hasAttachments
+            ...(!isConfiguredAgent && hasAttachments
               ? {
                   connectedFederatedConnections: ["dummyId"],
                   clientInfo: officeClientInfo,
                 }
               : {}),
           },
-          ...(hasAttachments
-            ? {}
-            : {
-                gpts: [
-                  {
-                    id: "bizchat-as-gpt-scenario",
-                    source: "BuiltInAgents",
-                    clientOverrides: {
-                      capabilities: [
-                        { name: "WebSearch" },
-                        { name: "WorkSearch" },
-                      ],
-                      "deepResearchModels@odata.type": "Collection(String)",
+          ...(isConfiguredAgent
+            ? { gpts: [configuredGpt] }
+            : hasAttachments
+              ? {}
+              : {
+                  gpts: [
+                    {
+                      id: "bizchat-as-gpt-scenario",
+                      source: "BuiltInAgents",
+                      clientOverrides: {
+                        capabilities: [
+                          { name: "WebSearch" },
+                          { name: "WorkSearch" },
+                        ],
+                        "deepResearchModels@odata.type": "Collection(String)",
+                      },
                     },
-                  },
-                ],
-              }),
-          plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
-          ...(hasAttachments ? { isSbsSupported: true } : {}),
-          tone: tone || "Claude_Opus",
+                  ],
+                }),
+          ...(isConfiguredAgent
+            ? {}
+            : { plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }] }),
+          ...(!isConfiguredAgent && hasAttachments
+            ? { isSbsSupported: true }
+            : {}),
+          tone: isConfiguredAgent
+            ? String(agentConfig.tone || tone || "Magic")
+            : tone || "Claude_Opus",
           renderReferencesBehindEOS: true,
           disconnectBehavior: "continue",
         },
@@ -760,6 +809,7 @@
       conversationId,
       attachments = [],
       requestedIdleTimeoutMs = 0,
+      agentConfig = {},
     ) {
       let ws = null;
       // Register this turn so a bridge M365_STOP can abort it. A stop can arrive
@@ -821,11 +871,47 @@
           attachments.some(
             (a) => a && a.url && a.verified === true && a.itemId && a.driveId,
           );
-        const transportProfile = hasAttachments
-          ? "&source=%22officeweb%22&product=Office&agentHost=Bizchat.ChatPanel" +
-            "&licenseType=Starter&isEdu=true&agent=work&scenario=officeweb"
-          : "&source=%22owahub%22&product=OwaHub&agentHost=Bizchat.FullScreen" +
-            "&licenseType=Starter&isEdu=true&agent=work&scenario=owahub";
+        const agentId = String(agentConfig.id || "");
+        const agentSource = String(agentConfig.source || "");
+        const isConfiguredAgent = Boolean(agentId && agentSource);
+        const agentScenario = String(agentConfig.source_scenario || "");
+        const agentProduct = String(agentConfig.product || "");
+        const agentHost = String(agentConfig.agent_host || "");
+        const agentKind = String(agentConfig.agent || "");
+        const agentLicenseType = String(agentConfig.license_type || "");
+        const agentIsEdu = agentConfig.is_edu === true ? "true" : "false";
+        if (
+          isConfiguredAgent &&
+          (!agentScenario ||
+            !agentProduct ||
+            !agentHost ||
+            !agentKind ||
+            !agentLicenseType)
+        )
+          throw new Error("incomplete M365 agentConfig from Python");
+        const transportProfile = isConfiguredAgent
+          ? "&source=%22" +
+            encodeURIComponent(agentScenario) +
+            "%22" +
+            "&product=" +
+            encodeURIComponent(agentProduct) +
+            "&agentHost=" +
+            encodeURIComponent(agentHost) +
+            "&licenseType=" +
+            encodeURIComponent(agentLicenseType) +
+            "&isEdu=" +
+            agentIsEdu +
+            "&agent=" +
+            encodeURIComponent(agentKind) +
+            "&scenario=" +
+            encodeURIComponent(agentScenario) +
+            "&gptId=" +
+            encodeURIComponent(agentId + "@" + agentSource)
+          : hasAttachments
+            ? "&source=%22officeweb%22&product=Office&agentHost=Bizchat.ChatPanel" +
+              "&licenseType=Starter&isEdu=true&agent=work&scenario=officeweb"
+            : "&source=%22owahub%22&product=OwaHub&agentHost=Bizchat.FullScreen" +
+              "&licenseType=Starter&isEdu=true&agent=work&scenario=owahub";
         const url =
           "wss://substrate.office.com/m365Copilot/Chathub/" +
           encodeURIComponent(oid) +
@@ -855,7 +941,13 @@
           return;
         }
         ws = new WebSocket(url); // browser supplies this frame's Origin
-        const { args } = buildChatArgs(text, tone, convId, attachments);
+        const { args } = buildChatArgs(
+          text,
+          tone,
+          convId,
+          attachments,
+          agentConfig,
+        );
         const invId = "0"; // 全新 socket,首个调用用 "0"(每 socket 只发一轮)
         // The answer may be delivered across MULTIPLE messageIds within a
         // single turn: when the model takes a tool-call / reasoning break, the

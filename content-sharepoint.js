@@ -414,7 +414,7 @@
           // (≈1h) credential-less URL that streams the file bytes directly; the
           // permalink (`url`) stays the stable, login-gated share link. Selecting
           // it here is the only way to surface it (it is not returned by default).
-          "/driveItem?$select=id,name,size,file,parentReference,content.downloadUrl";
+          "/driveItem?$select=id,name,size,file,parentReference,sharepointIds,content.downloadUrl";
         const item = await spFetchRetry(driveItemUrl, {
           credentials: "omit",
           headers: {
@@ -436,9 +436,35 @@
           Number(item.size || downloaded.byteLength) !== downloaded.byteLength
         )
           throw new Error("SharePoint driveItem size mismatch for " + name);
+        const spIds = item.sharepointIds || {};
+        const spoScope = [spIds.siteId, spIds.webId, spIds.listId]
+          .map((value) => String(value || ""))
+          .filter(Boolean);
+        const listItemUniqueId = String(spIds.listItemUniqueId || "");
+        const encodeBase64UrlUtf8 = (value) => {
+          const bytes = new TextEncoder().encode(String(value));
+          let binary = "";
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          return btoa(binary)
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+        };
+        const agentFileId =
+          spoScope.length === 3 && listItemUniqueId
+            ? "SPO_" +
+              encodeBase64UrlUtf8(spoScope.join(",")) +
+              "_" +
+              listItemUniqueId.replace(/[{}]/g, "").toUpperCase()
+            : "";
         uploaded.push({
           name,
           url,
+          agentFileId,
+          fileType: name.includes(".")
+            ? name.split(".").pop().toLowerCase()
+            : "",
+          sharepointIds: spIds,
           // Pre-authenticated direct-download URL (may be "" if the tenant/item
           // does not expose it); consumers must fall back to `url` when absent.
           downloadUrl: String(item["@content.downloadUrl"] || ""),
