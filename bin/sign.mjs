@@ -1,0 +1,383 @@
+// @ts-check
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
+
+import webExt from "web-ext";
+
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+const rootPath = path.join(__dirname, "../");
+
+// Single source of truth for the version: the extension manifest.
+const manifestJson = JSON.parse(
+    fs.readFileSync(path.join(rootPath, "manifest.json"), { encoding: "utf-8" })
+);
+const EXTENSION_VERSION = manifestJson.version;
+const EXTENSION_ID = manifestJson.browser_specific_settings?.gecko?.id;
+
+const signedPath = path.join(rootPath, "dist", "signed");
+
+// Repo files that must not be packaged into the extension. Hidden files
+// and folders (.github, .gitignore, ...), node_modules and the
+// artifacts dir are already ignored by web-ext by default. Bare
+// directory names are needed in addition to "dir/**" because the
+// archive's directory entries are matched separately.
+const IGNORE_FILES = [
+    "package.json",
+    "package-lock.json",
+    "bin",
+    "bin/**",
+    "dist",
+    "web-ext-artifacts"
+];
+
+const SIGN_RETRY_DELAYS_MS = [30_000, 90_000, 180_000];
+
+// AMO API v5 (v4 is frozen). web-ext >= 10 signs through v5 as well, so
+// recovery and signing share the same API surface.
+const AMO_API_PREFIX = "https://addons.mozilla.org/api/v5";
+// web-ext >= 10's programmatic cmd.sign() bypasses the yargs option
+// defaults (only the CLI gets this), so the submission API base URL
+// must be passed explicitly or signing fails with
+// "Invalid AMO API base URL: undefined".
+const AMO_SUBMIT_API_BASE_URL = "https://addons.mozilla.org/api/v5/";
+const RECOVERY_POLL_INTERVAL_MS = 30_000;
+const RECOVERY_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Thrown when the version exists at AMO but recovery cannot produce a
+ * signed file right now (still processing, or awaiting manual review).
+ * Carries a user-actionable message; unlike network errors this is not
+ * worth silently swallowing in favor of the original signing error.
+ */
+class SigningRecoveryError extends Error {}
+
+/**
+ * HS256 JWT for the AMO API, mirroring what sign-addon's amo-client sends
+ * ({iss, iat, exp} signed with the API secret as the HMAC key).
+ *
+ * @param {string} apiKey
+ * @param {string} apiSecret
+ * @returns {string}
+ */
+function createAmoAuthToken(apiKey, apiSecret) {
+    const encodePart = value =>
+        Buffer.from(JSON.stringify(value)).toString("base64url");
+    const header = encodePart({ alg: "HS256", typ: "JWT" });
+    const now = Math.floor(Date.now() / 1000);
+    const payload = encodePart({ iss: apiKey, iat: now, exp: now + 300 });
+    const signature = crypto
+        .createHmac("sha256", apiSecret)
+        .update(`${header}.${payload}`)
+        .digest("base64url");
+    return `${header}.${payload}.${signature}`;
+}
+
+/**
+ * GET the AMO v5 version detail. web-ext >= 10 submits through this same
+ * API, so the version this returns is exactly the one signing created.
+ *
+ * The `v` prefix forces lookup by version number: a version string
+ * without dots would otherwise be treated as a numeric version id.
+ *
+ * 404 means the version was never created (upload failed or validation
+ * failed — validation errors never create a version in v5), so there is
+ * nothing to recover.
+ *
+ * @param {{ apiKey: string, apiSecret: string, version: string }} args
+ * @returns {Promise<{ status: number, body: object }>}
+ */
+async function fetchAmoVersionStatus({ apiKey, apiSecret, version }) {
+    const versionUrl =
+        `${AMO_API_PREFIX}/addons/addon/` +
+        `${encodeURIComponent(EXTENSION_ID ?? "")}` +
+        `/versions/v${encodeURIComponent(version)}/`;
+    const res = await fetch(versionUrl, {
+        headers: {
+            Authorization: `JWT ${createAmoAuthToken(apiKey, apiSecret)}`,
+            Accept: "application/json"
+        }
+    });
+    return { status: res.status, body: res.ok ? await res.json() : {} };
+}
+
+/**
+ * Download the signed file AMO lists for the version into downloadDir.
+ * Mirrors web-ext 10's downloadSignedFile: fetch file.url (absolute)
+ * with the same JWT auth — unlisted files are not publicly downloadable.
+ *
+ * @param {{ apiKey: string, apiSecret: string }} args
+ * @param {string} fileUrl
+ * @param {string} downloadDir
+ * @returns {Promise<{ downloadedFiles: string[] }>}
+ */
+async function downloadAmoSignedFile({ apiKey, apiSecret }, fileUrl, downloadDir) {
+    const res = await fetch(fileUrl, {
+        headers: {
+            Authorization: `JWT ${createAmoAuthToken(apiKey, apiSecret)}`
+        }
+    });
+    if (!res.ok) {
+        throw new Error(
+            `Downloading ${fileUrl} failed with status ${res.status}`
+        );
+    }
+    const fileName = path.join(
+        downloadDir,
+        path.basename(new URL(fileUrl).pathname)
+    );
+    fs.writeFileSync(fileName, Buffer.from(await res.arrayBuffer()));
+    return { downloadedFiles: [fileName] };
+}
+
+/**
+ * Recover a signed xpi from a version that was already uploaded to AMO.
+ *
+ * This handles the failure mode where the upload succeeded but the
+ * process died before downloading the signed file (e.g. network drop
+ * while waiting for approval). Every later signing attempt for the same
+ * version is rejected by AMO with "Version already exists", so the only
+ * way forward is to fetch the already-signed file from the API.
+ *
+ * State mapping (v5 version detail `file.status`):
+ * - public:   signed and downloadable — recover it
+ * - disabled: rejected or disabled — permanent failure
+ * - unreviewed / no file yet: still processing or awaiting manual
+ *   review — poll until the deadline
+ *
+ * @param {{ apiKey: string, apiSecret: string, version: string, downloadDir: string }} args
+ * @returns {Promise<{ downloadedFiles: string[] } | null>} null when the
+ * version does not exist at AMO (nothing to recover)
+ */
+async function recoverSignedXpiFromAmo({ apiKey, apiSecret, version, downloadDir }) {
+    const deadline = Date.now() + RECOVERY_TIMEOUT_MS;
+
+    for (let attempt = 0; ; attempt++) {
+        if (attempt > 0) {
+            await new Promise(resolve =>
+                setTimeout(resolve, RECOVERY_POLL_INTERVAL_MS)
+            );
+        }
+
+        const { status, body } = await fetchAmoVersionStatus({
+            apiKey,
+            apiSecret,
+            version
+        });
+
+        if (status === 404) {
+            return null;
+        }
+        if (status !== 200) {
+            throw new Error(`AMO version API returned status ${status}`);
+        }
+
+        // Mirrors web-ext 10's waitForApproval readiness check.
+        if (body.file?.status === "public" && body.file.url) {
+            return await downloadAmoSignedFile(
+                { apiKey, apiSecret },
+                body.file.url,
+                downloadDir
+            );
+        }
+
+        if (body.file?.status === "disabled") {
+            throw new SigningRecoveryError(
+                `Version ${version} was rejected or disabled at AMO and ` +
+                    `cannot be signed. Check ` +
+                    `https://addons.mozilla.org/developers/ for details.`
+            );
+        }
+
+        if (Date.now() >= deadline) {
+            throw new SigningRecoveryError(
+                `Version ${version} was submitted to AMO but is still ` +
+                    `being processed (or awaiting manual review) after ` +
+                    `${RECOVERY_TIMEOUT_MS / 60_000} minutes. The version ` +
+                    `number is consumed at AMO: once processing finishes, ` +
+                    `re-run this job (re-push the tag) and the signed file ` +
+                    `will be downloaded instead of re-signed.`
+            );
+        }
+
+        console.info(
+            `Version ${version} exists at AMO but is not ready yet; ` +
+                `re-checking in ${RECOVERY_POLL_INTERVAL_MS / 1000}s...`
+        );
+    }
+}
+
+/**
+ * AMO signing failures come in two flavors: transient server/network
+ * trouble (HTTP 429/5xx, connection resets) worth a backed-off retry,
+ * and permanent rejections (auth, validation, ID ownership, version
+ * conflicts) where retrying would only spam AMO — and for a submitted
+ * version can never succeed ("Version already exists"). web-ext wraps
+ * every error in WebExtError, so classify by message.
+ *
+ * web-ext >= 10 submits via native fetch, which reports network errors
+ * as "fetch failed" with the real cause on err.cause, and HTTP errors
+ * with the status text ("Too Many Requests", "Service Unavailable") —
+ * while the legacy stack (web-ext 7 / sign-addon) embedded the numeric
+ * status and errno codes in the message. Match both.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isTransientSigningError(err) {
+    if (!(err instanceof Error)) {
+        return false;
+    }
+
+    const messages = [err.message];
+    if (err.cause !== undefined && err.cause !== null) {
+        messages.push(
+            err.cause instanceof Error
+                ? err.cause.message
+                : String(err.cause)
+        );
+    }
+    const message = messages.join(" ");
+
+    // Node network-layer errors are always worth retrying. Native fetch
+    // (web-ext >= 10) surfaces them as "fetch failed"/"terminated" with
+    // the errno code only on err.cause.
+    if (
+        /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EPIPE|ECONNABORTED/i.test(
+            message
+        )
+    ) {
+        return true;
+    }
+    if (/fetch failed|terminated|socket hang up|network error/i.test(message)) {
+        return true;
+    }
+
+    // AMO rate limiting / server trouble, across both error formats.
+    if (/too many requests|bad gateway|service unavailable|gateway timeout|internal server error/i.test(message)) {
+        return true;
+    }
+
+    // Legacy sign-addon embeds "status: <code>" in its error messages.
+    const statusMatch = message.match(/status: (\d{3})/);
+    if (statusMatch) {
+        const status = Number(statusMatch[1]);
+        return status === 429 || status >= 500;
+    }
+
+    return false;
+}
+
+/**
+ * @param {import("web-ext").SignOptions} options
+ * @param {{ apiKey: string, apiSecret: string, version: string, downloadDir: string }} recovery
+ */
+async function signWithRetry(options, recovery) {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await webExt.cmd.sign(options, {
+                // Prevent auto-exit
+                shouldExitProgram: false
+            });
+        } catch (err) {
+            const delay = SIGN_RETRY_DELAYS_MS[attempt];
+            if (delay === undefined || !isTransientSigningError(err)) {
+                // Permanent failure, or transient retries exhausted. A
+                // previous attempt may have already uploaded the version
+                // to AMO before dying (e.g. a network drop while waiting
+                // for approval) — every re-upload is then rejected with
+                // "Version already exists". Try to recover by fetching
+                // the signed file straight from the AMO API.
+                console.warn(
+                    "Signing failed; checking AMO for an existing version...",
+                    {
+                        error: err instanceof Error ? err.message : String(err)
+                    }
+                );
+                try {
+                    const recovered = await recoverSignedXpiFromAmo(recovery);
+                    if (recovered) {
+                        console.info(
+                            "Recovered the signed xpi from AMO instead of re-signing"
+                        );
+                        return recovered;
+                    }
+                } catch (recoveryError) {
+                    if (recoveryError instanceof SigningRecoveryError) {
+                        throw recoveryError;
+                    }
+                    console.error(
+                        "AMO recovery check failed:",
+                        recoveryError instanceof Error
+                            ? recoveryError.message
+                            : String(recoveryError)
+                    );
+                }
+                throw err;
+            }
+
+            console.warn(
+                `Signing failed with a transient error; retrying in ${
+                    delay / 1000
+                }s`,
+                {
+                    attempt: attempt + 1,
+                    error: err instanceof Error ? err.message : String(err)
+                }
+            );
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+}
+
+// webExt.cmd.sign is the programmatic API and, unlike the CLI
+// (--api-key/--api-secret), does not read these env vars itself.
+const apiKey = process.env.WEB_EXT_API_KEY;
+const apiSecret = process.env.WEB_EXT_API_SECRET;
+if (!apiKey || !apiSecret) {
+    console.error(
+        "Signing requires WEB_EXT_API_KEY and WEB_EXT_API_SECRET env vars"
+    );
+    process.exitCode = 1;
+} else {
+    fs.mkdirSync(signedPath, { recursive: true });
+
+    signWithRetry(
+        {
+            apiKey,
+            apiSecret,
+            // The repo root is the extension source; web-ext packages it
+            // itself before uploading.
+            sourceDir: rootPath,
+            ignoreFiles: IGNORE_FILES,
+            artifactsDir: signedPath,
+            amoBaseUrl: AMO_SUBMIT_API_BASE_URL,
+            // Self-distributed add-on, not listed on AMO
+            channel: "unlisted"
+        },
+        {
+            apiKey,
+            apiSecret,
+            version: EXTENSION_VERSION,
+            downloadDir: signedPath
+        }
+    )
+        .then(
+            /** @param {{ downloadedFiles: string[] }} result */
+            result => {
+                // web-ext >= 10 returns bare filenames; the legacy
+                // stack returned absolute paths. Normalize.
+                for (const file of result.downloadedFiles ?? []) {
+                    console.info(
+                        `Signed extension: ${path.isAbsolute(file) ? file : path.join(signedPath, file)}`
+                    );
+                }
+            }
+        )
+        .catch(err => {
+            console.error("Signing failed!", err);
+            process.exitCode = 1;
+        });
+}
