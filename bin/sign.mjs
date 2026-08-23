@@ -10,28 +10,34 @@ import webExt from "web-ext";
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const rootPath = path.join(__dirname, "../");
 
-// Single source of truth for the version: the extension manifest.
+// Monorepo layout: the Firefox (MV2) extension is assembled by build.mjs into
+// dist/firefox (with its own generated manifest.json). Sign THAT built dir,
+// not the repo root — the root holds build tooling, the Chrome sources and
+// three partial manifests, none of which belong in the signed add-on.
+// Run `node build.mjs firefox` before this script (the CI workflow does).
+const builtFirefoxPath = path.join(rootPath, "dist", "firefox");
+const builtManifestPath = path.join(builtFirefoxPath, "manifest.json");
+
+if (!fs.existsSync(builtManifestPath)) {
+    console.error(
+        `Built Firefox manifest not found at ${builtManifestPath}. ` +
+            `Run \`node build.mjs firefox\` (or \`npm run build:firefox\`) first.`
+    );
+    process.exit(1);
+}
+
+// Single source of truth for the version/id: the BUILT manifest.
 const manifestJson = JSON.parse(
-    fs.readFileSync(path.join(rootPath, "manifest.json"), { encoding: "utf-8" })
+    fs.readFileSync(builtManifestPath, { encoding: "utf-8" })
 );
 const EXTENSION_VERSION = manifestJson.version;
 const EXTENSION_ID = manifestJson.browser_specific_settings?.gecko?.id;
 
 const signedPath = path.join(rootPath, "dist", "signed");
 
-// Repo files that must not be packaged into the extension. Hidden files
-// and folders (.github, .gitignore, ...), node_modules and the
-// artifacts dir are already ignored by web-ext by default. Bare
-// directory names are needed in addition to "dir/**" because the
-// archive's directory entries are matched separately.
-const IGNORE_FILES = [
-    "package.json",
-    "package-lock.json",
-    "bin",
-    "bin/**",
-    "dist",
-    "web-ext-artifacts"
-];
+// dist/firefox contains only the packaged extension files, so nothing extra
+// needs excluding. web-ext still ignores its own artifacts dir by default.
+const IGNORE_FILES = [];
 
 const SIGN_RETRY_DELAYS_MS = [30_000, 90_000, 180_000];
 
@@ -348,9 +354,9 @@ if (!apiKey || !apiSecret) {
         {
             apiKey,
             apiSecret,
-            // The repo root is the extension source; web-ext packages it
-            // itself before uploading.
-            sourceDir: rootPath,
+            // The built dist/firefox dir is the extension source; web-ext
+            // packages it itself before uploading.
+            sourceDir: builtFirefoxPath,
             ignoreFiles: IGNORE_FILES,
             artifactsDir: signedPath,
             amoBaseUrl: AMO_SUBMIT_API_BASE_URL,

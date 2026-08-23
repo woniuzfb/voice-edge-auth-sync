@@ -1,5 +1,16 @@
 "use strict";
 
+// Load the WebExtension shim first. On Firefox it is also listed in the
+// manifest background.scripts array and self-detects as a no-op; the
+// importScripts() call only matters inside a Chromium MV3 service worker and
+// harmlessly throws (caught) in a Firefox background page.
+try {
+  importScripts("browser-polyfill.js");
+} catch (e) {}
+
+// MV2 exposes browser_action; MV3 exposes action. Pick whichever exists.
+const actionApi = browser.action || browser.browserAction;
+
 const NATIVE_HOST = "com.voice_edge.auth_bridge";
 const COMPLETION_FILTER = {
   urls: ["https://www.doubao.com/chat/completion*"],
@@ -48,9 +59,9 @@ async function notify(title, message) {
 
 async function setBadge(text, color) {
   try {
-    await browser.browserAction.setBadgeText({ text });
+    await actionApi.setBadgeText({ text });
     if (color) {
-      await browser.browserAction.setBadgeBackgroundColor({ color });
+      await actionApi.setBadgeBackgroundColor({ color });
     }
   } catch (_) {
     // Badge updates are best-effort only.
@@ -663,6 +674,17 @@ function findTtwidInCookies(cookies) {
 // 兜底从页面 document.cookie 读取 ttwid（ttwid 通常不是 HttpOnly）。
 async function fetchTtwidFromTab(tabId) {
   try {
+    // MV3 forbids code strings; use scripting.executeScript({func}) when present,
+    // otherwise fall back to the MV2 tabs.executeScript({code}).
+    if (browser.scripting && browser.scripting.executeScript) {
+      const results = await browser.scripting.executeScript({
+        target: { tabId },
+        func: () =>
+          (document.cookie.match(/(?:^|;\s*)ttwid=([^;]+)/) || [])[1] || "",
+      });
+      const value = results && results[0] && results[0].result;
+      return typeof value === "string" ? value.trim() : "";
+    }
     const results = await browser.tabs.executeScript(tabId, {
       code: "(document.cookie.match(/(?:^|;\\s*)ttwid=([^;]+)/)||[])[1]||''",
       runAt: "document_idle",
@@ -736,100 +758,129 @@ async function synchronizeCapture(capture, automatic) {
   });
 }
 
-browser.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (details.method !== "POST" || details.tabId < 0) return;
-    let filter;
-    try {
-      filter = browser.webRequest.filterResponseData(details.requestId);
-    } catch (_) {
-      return;
+// Shared finalizer for a captured Doubao /chat/completion SSE body. Both the
+// Firefox response-stream path and the Chromium page-relay path feed into this.
+async function ingestDoubaoBody(body, tabId, cookieStoreId, startedAt, completedAt) {
+  if (!body || body.length > MAX_CAPTURE_BYTES) return;
+  const state = parseSseBody(body);
+  const complete = Boolean(
+    state.conversationId &&
+    state.sectionId &&
+    state.lastMessageIndex > 0 &&
+    state.endType3 &&
+    !state.streamError,
+  );
+  const capture = {
+    tabId,
+    cookieStoreId: cookieStoreId || "",
+    startedAt: Number(startedAt || Date.now()),
+    completedAt: Number(completedAt || Date.now()),
+    complete,
+    error: state.streamError,
+    conversation: {
+      conversation_id: state.conversationId,
+      section_id: state.sectionId,
+      last_message_index: state.lastMessageIndex,
+    },
+  };
+  lastCaptured = capture;
+  if (complete) {
+    // A green badge has one unambiguous meaning: Voice Edge requested an auth
+    // refresh and this completed response is about to be synced.
+    if (authRequired) {
+      await setBadge("\u2713", "#188038");
+      scheduleAutoSync(capture);
     }
+  } else if (state.streamError && authRequired) {
+    await setBadge("!", "#d93025");
+  }
+}
 
-    const decoder = new TextDecoder();
-    let body = "";
-    let capturedBytes = 0;
-    let overflow = false;
-
-    filter.ondata = (event) => {
-      filter.write(event.data);
-      if (overflow) return;
-      capturedBytes += event.data.byteLength;
-      if (capturedBytes > MAX_CAPTURE_BYTES) {
-        overflow = true;
-        body = "";
+// Doubao completion capture — platform-detected.
+//   Firefox: read the response body directly via filterResponseData.
+//   Chromium: no response-body API, so content-doubao.js hooks fetch/XHR in the
+//             page world and relays the raw SSE text as a DOUBAO_CAPTURE message.
+// Both call the identical ingestDoubaoBody() above.
+if (
+  browser.webRequest &&
+  typeof browser.webRequest.filterResponseData === "function"
+) {
+  browser.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (details.method !== "POST" || details.tabId < 0) return;
+      let filter;
+      try {
+        filter = browser.webRequest.filterResponseData(details.requestId);
+      } catch (_) {
         return;
       }
-      body += decoder.decode(event.data, { stream: true });
-    };
 
-    filter.onstop = async () => {
-      try {
-        body += decoder.decode();
-        filter.close();
+      const decoder = new TextDecoder();
+      let body = "";
+      let capturedBytes = 0;
+      let overflow = false;
+
+      filter.ondata = (event) => {
+        filter.write(event.data);
         if (overflow) return;
-        const state = parseSseBody(body);
-        const complete = Boolean(
-          state.conversationId &&
-          state.sectionId &&
-          state.lastMessageIndex > 0 &&
-          state.endType3 &&
-          !state.streamError,
-        );
-        const tab = await browser.tabs.get(details.tabId);
-        const capture = {
-          tabId: details.tabId,
-          cookieStoreId: tab.cookieStoreId || "",
-          startedAt: Number(details.timeStamp || Date.now()),
-          completedAt: Date.now(),
-          complete,
-          error: state.streamError,
-          conversation: {
-            conversation_id: state.conversationId,
-            section_id: state.sectionId,
-            last_message_index: state.lastMessageIndex,
-          },
-        };
-        lastCaptured = capture;
-        if (complete) {
-          // A green badge has one unambiguous meaning: Voice Edge requested an
-          // auth refresh and this completed response is about to be synced.
-          if (authRequired) {
-            await setBadge("✓", "#188038");
-            scheduleAutoSync(capture);
-          }
-        } else if (state.streamError && authRequired) {
-          await setBadge("!", "#d93025");
+        capturedBytes += event.data.byteLength;
+        if (capturedBytes > MAX_CAPTURE_BYTES) {
+          overflow = true;
+          body = "";
+          return;
         }
-      } catch (error) {
+        body += decoder.decode(event.data, { stream: true });
+      };
+
+      filter.onstop = async () => {
+        try {
+          body += decoder.decode();
+          filter.close();
+          if (overflow) return;
+          const tab = await browser.tabs.get(details.tabId);
+          await ingestDoubaoBody(
+            body,
+            details.tabId,
+            tab.cookieStoreId || "",
+            Number(details.timeStamp || Date.now()),
+            Date.now(),
+          );
+        } catch (error) {
+          try {
+            filter.close();
+          } catch (_) {}
+        }
+      };
+
+      filter.onerror = () => {
         try {
           filter.close();
         } catch (_) {}
-      }
-    };
+      };
+    },
+    COMPLETION_FILTER,
+    ["blocking"],
+  );
+} else {
+  browser.runtime.onMessage.addListener((message, sender) => {
+    if (!message || message.type !== "DOUBAO_CAPTURE") return;
+    const tab = sender && sender.tab;
+    const tabId = tab && typeof tab.id === "number" ? tab.id : -1;
+    if (tabId < 0) return;
+    ingestDoubaoBody(
+      message.body,
+      tabId,
+      (tab && tab.cookieStoreId) || "",
+      Number(message.startedAt || Date.now()),
+      Number(message.completedAt || Date.now()),
+    ).catch(() => {});
+  });
+}
 
-    filter.onerror = () => {
-      try {
-        filter.close();
-      } catch (_) {}
-    };
-  },
-  COMPLETION_FILTER,
-  ["blocking"],
-);
-
-browser.browserAction.onClicked.addListener(async () => {
-  try {
-    if (!lastCaptured || !lastCaptured.complete || lastCaptured.error) {
-      throw new Error("请先在豆包网页发送一条消息并等待完整回复");
-    }
-    await synchronizeCapture(lastCaptured, false);
-  } catch (error) {
-    syncInFlight = false;
-    await setBadge("!", "#d93025");
-    await notify("Voice Edge 手动同步失败", compactError(error));
-  }
-});
+// (Removed a browser.action.onClicked listener here: with default_popup set in
+// both manifests the toolbar click always opens the popup and onClicked never
+// fires. The same manual-sync path is exposed to the popup via the
+// POPUP_SYNC_DOUBAO message, so this was unreachable dead code.)
 
 connectNative();
 

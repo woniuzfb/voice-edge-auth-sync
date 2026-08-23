@@ -1,12 +1,18 @@
 {
   "name": "voice-edge-auth-sync",
   "private": true,
-  "version": "1.7.4",
+  "version": "1.8.0",
   "type": "module",
-  "description": "Syncs browser authentication and conversation state for Voice Edge",
+  "description": "Syncs browser authentication and conversation state for Voice Edge (single source, builds Firefox MV2 + Chrome MV3)",
   "scripts": {
-    "package": "web-ext build --source-dir . --artifacts-dir dist --overwrite-dest --ignore-files package.json package-lock.json bin \"bin/**\" dist web-ext-artifacts",
-    "sign": "node bin/sign.mjs",
+    "build": "node build.mjs all",
+    "build:firefox": "node build.mjs firefox",
+    "build:chrome": "node build.mjs chrome",
+    "package": "node build.mjs all --zip",
+    "package:firefox": "node build.mjs firefox --zip",
+    "package:chrome": "node build.mjs chrome --zip",
+    "package:source": "tar --exclude='dist' --exclude='node_modules' --exclude='.git' --exclude='.DS_Store' -czf voice-edge-auth-sync-source.tar.gz src manifest.base.json manifest.firefox.json manifest.chrome.json build.mjs package.json README.md .github bin",
+    "sign": "node build.mjs firefox && node bin/sign.mjs",
     "release": "tag=${npm_config_tag:?Usage: npm run release --tag=vx.y.z}; git tag \"$tag\" && git push origin \"$tag\""
   },
   "devDependencies": {

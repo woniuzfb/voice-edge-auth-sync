@@ -1,30 +1,23 @@
 {
-  "manifest_version": 2,
-  "name": "Voice Edge Auth Sync",
-  "version": "1.7.4",
-  "description": "Syncs browser authentication and conversation state for Voice Edge, including M365 Copilot Chathub.",
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "voice-edge-auth-sync@local",
-      "data_collection_permissions": {
-        "required": ["none"]
-      }
-    }
-  },
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtRvUp6VmXCW47znwbOqVCm7C7Nw4hk3bFmFV8+DGmlGhhma98qd9PREMZE5xnxSIF+QVqNZ9imwfuWvtvAhUL76Pz2PipLtr+i8RzoSpcGapDDH4E5h+KMWk+uVNDbXo9fzrdS2y5hSIox43iqcAGV44vWOs7hHLnx2U+TqorNsnfQM1hGwbZlpE70XsIIZoJz1WtHB8aqz5Rjscdtt6ck9w7TYeG8Dct/tBTMHp34B9REwYOP5C2xPeDCB221pb4O0IRyc73U52BoB5TkqbOZq4Ss7E73BYt/HWkgb/Tp+Apz4rFGk83xrdf9kLmBqLTzxHiRQhILFAGE7+GPNVNQIDAQAB",
   "permissions": [
     "cookies",
     "tabs",
     "notifications",
     "nativeMessaging",
     "webRequest",
-    "webRequestBlocking",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
     "https://www.doubao.com/*",
     "https://*.doubao.com/*",
     "https://chat.qwen.ai/*",
     "https://*.qwen.ai/*",
     "https://chat.deepseek.com/*",
     "https://*.deepseek.com/*",
-    "storage",
     "https://login.microsoftonline.com/*",
     "https://substrate.office.com/*",
     "https://outlook.cloud.microsoft/*",
@@ -34,12 +27,18 @@
     "https://*.sharepoint.com/*"
   ],
   "background": {
-    "scripts": ["background.js"]
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
+      "matches": ["https://www.doubao.com/*"],
+      "js": ["browser-polyfill.js", "content-doubao.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
       "matches": ["https://chat.deepseek.com/*"],
-      "js": ["content-deepseek.js"],
+      "js": ["browser-polyfill.js", "content-deepseek.js"],
       "run_at": "document_idle"
     },
     {
@@ -49,18 +48,18 @@
         "https://outlook.office.com/*",
         "https://m365copilotapp.svc.cloud.microsoft/*"
       ],
-      "js": ["content-m365.js"],
+      "js": ["browser-polyfill.js", "content-m365.js"],
       "run_at": "document_start",
       "all_frames": true
     },
     {
       "matches": ["https://*.sharepoint.com/sites/*"],
-      "js": ["content-sharepoint.js"],
+      "js": ["browser-polyfill.js", "content-sharepoint.js"],
       "run_at": "document_idle",
       "all_frames": false
     }
   ],
-  "browser_action": {
+  "action": {
     "default_title": "Voice Edge",
     "default_popup": "popup.html",
     "default_icon": {
@@ -68,11 +67,5 @@
       "32": "icons/icon-32.png",
       "48": "icons/icon-48.png"
     }
-  },
-  "icons": {
-    "16": "icons/icon-16.png",
-    "48": "icons/icon-48.png",
-    "96": "icons/icon-96.png",
-    "128": "icons/icon-128.png"
   }
 }
