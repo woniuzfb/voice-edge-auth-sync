@@ -480,9 +480,7 @@
         _veM365RtClientId = String(d.rtClientId || _veM365RtClientId || "");
       }
       const tid = String((d && d.tid) || "");
-      const clientId = String(
-        (d && d.clientId) || _veM365RtClientId || "",
-      );
+      const clientId = String((d && d.clientId) || _veM365RtClientId || "");
       if (!tid || !clientId || !_veM365Rt) {
         post({
           type: "M365_PAGE_TOKEN_PROBE_RESULT",
@@ -517,8 +515,7 @@
             method: "POST",
             headers: {
               Accept: "*/*",
-              "Content-Type":
-                "application/x-www-form-urlencoded;charset=utf-8",
+              "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
             },
             body: params.toString(),
           },
@@ -593,8 +590,8 @@
             try {
               userInitiated = Boolean(
                 window.navigator &&
-                  window.navigator.userActivation &&
-                  window.navigator.userActivation.isActive,
+                window.navigator.userActivation &&
+                window.navigator.userActivation.isActive,
               );
             } catch (_) {}
             if (!userInitiated) {
@@ -655,7 +652,9 @@
         return origOpen.apply(this, arguments);
       }
       try {
-        Object.defineProperty(wrappedOpen, "__veM365PopupHook", { value: true });
+        Object.defineProperty(wrappedOpen, "__veM365PopupHook", {
+          value: true,
+        });
       } catch (_) {}
       window.open = wrappedOpen;
     })();
@@ -698,7 +697,12 @@
         _abtRetryTimer = null;
         touchM365AbtActivity(true);
       }, delay);
-      dbg("scheduled ABT retry #%d in %dms (%s)", _abtRetryAttempt, delay, reason || "");
+      dbg(
+        "scheduled ABT retry #%d in %dms (%s)",
+        _abtRetryAttempt,
+        delay,
+        reason || "",
+      );
     }
 
     function clearAbtRetry() {
@@ -806,8 +810,7 @@
         touchM365AbtActivity(true);
       });
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible")
-          touchM365AbtActivity(false);
+        if (document.visibilityState === "visible") touchM365AbtActivity(false);
       });
     })();
 
@@ -823,7 +826,8 @@
           this.__veUrl = u;
           this.__veMethod = String(method || "GET").toUpperCase();
           if (/\/abt\/userstate\b/i.test(u)) {
-            const isPromptOrSignout = /[?&]action=SHOULD_(?:PROMPT|SIGNOUT)\b/i.test(u);
+            const isPromptOrSignout =
+              /[?&]action=SHOULD_(?:PROMPT|SIGNOUT)\b/i.test(u);
             if (isPromptOrSignout) {
               // 在 open 阶段率先注册 load 监听器（早于调用方设置 xhr.onload），
               // 兼容 responseType 为 ""/"text" 或 "json"，并在 finally 中确保触发续期。
@@ -880,8 +884,12 @@
                   });
                 } catch (_) {}
               };
-              this.addEventListener("error", () => onAbtNetworkFail("xhr-error"));
-              this.addEventListener("timeout", () => onAbtNetworkFail("xhr-timeout"));
+              this.addEventListener("error", () =>
+                onAbtNetworkFail("xhr-error"),
+              );
+              this.addEventListener("timeout", () =>
+                onAbtNetworkFail("xhr-timeout"),
+              );
               this.addEventListener("load", function () {
                 const st = Number(this.status || 0);
                 if (st >= 200 && st < 300) {
@@ -3297,15 +3305,13 @@
       browser.runtime
         .sendMessage({
           __veM365: true,
-          type: succeeded ? "M365_SESSION_RENEWED" : "M365_SESSION_RENEW_FAILED",
+          type: succeeded
+            ? "M365_SESSION_RENEWED"
+            : "M365_SESSION_RENEW_FAILED",
           at: Date.now(),
           frameOrigin: location.origin,
           invokedAbt,
-          error: isOffline
-            ? "offline"
-            : succeeded
-              ? ""
-              : "page-hook-unready",
+          error: isOffline ? "offline" : succeeded ? "" : "page-hook-unready",
         })
         .catch(() => {});
     } catch (_) {}

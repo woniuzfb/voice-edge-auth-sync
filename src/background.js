@@ -760,7 +760,13 @@ async function synchronizeCapture(capture, automatic) {
 
 // Shared finalizer for a captured Doubao /chat/completion SSE body. Both the
 // Firefox response-stream path and the Chromium page-relay path feed into this.
-async function ingestDoubaoBody(body, tabId, cookieStoreId, startedAt, completedAt) {
+async function ingestDoubaoBody(
+  body,
+  tabId,
+  cookieStoreId,
+  startedAt,
+  completedAt,
+) {
   if (!body || body.length > MAX_CAPTURE_BYTES) return;
   const state = parseSseBody(body);
   const complete = Boolean(
@@ -1057,49 +1063,51 @@ async function popupOpen(provider) {
 browser.runtime.onMessage.addListener((message, sender) => {
   if (!message || typeof message !== "object") return;
   if (message.type === "M365_GET_AUTO_LOGIN_CONFIG") {
-    return Promise.all([ensureM365AuthLoaded(), ensureM365AutoLoginLoaded()]).then(
-      () => {
-        const armed = isSenderArmedM365LoginTab(sender, message);
-        if (armed && _pendingTopLevelReauth) {
-          _pendingTopLevelReauth.pageSeen = true;
-          if (_pendingTopLevelReauth.loadWatchdog) {
-            clearTimeout(_pendingTopLevelReauth.loadWatchdog);
-            _pendingTopLevelReauth.loadWatchdog = null;
-          }
+    return Promise.all([
+      ensureM365AuthLoaded(),
+      ensureM365AutoLoginLoaded(),
+    ]).then(() => {
+      const armed = isSenderArmedM365LoginTab(sender, message);
+      if (armed && _pendingTopLevelReauth) {
+        _pendingTopLevelReauth.pageSeen = true;
+        if (_pendingTopLevelReauth.loadWatchdog) {
+          clearTimeout(_pendingTopLevelReauth.loadWatchdog);
+          _pendingTopLevelReauth.loadWatchdog = null;
         }
-        log(
-          "M365 auto-login config request tab=%s armed=%s pendingTab=%s armedTab=%s armedUntil=%s enabled=%s paused=%s hasPassword=%s",
-          sender && sender.tab ? sender.tab.id : "?",
-          armed,
-          _pendingTopLevelReauth ? _pendingTopLevelReauth.tabId : "none",
-          _armedPopupTabId,
-          Math.max(0, Math.round((_armedPopupWindowUntil - Date.now()) / 1000)) + "s",
-          Boolean(m365AutoLoginEnabled),
-          Boolean(m365AutoLoginPaused),
-          Boolean(m365AutoLoginPassword),
-        );
-        if (!armed) {
-          return {
-            enabled: false,
-            rememberOnManualLogin: false,
-            paused: Boolean(m365AutoLoginPaused),
-            armed: false,
-          };
-        }
-        const allowFill = Boolean(m365AutoLoginEnabled && !m365AutoLoginPaused);
+      }
+      log(
+        "M365 auto-login config request tab=%s armed=%s pendingTab=%s armedTab=%s armedUntil=%s enabled=%s paused=%s hasPassword=%s",
+        sender && sender.tab ? sender.tab.id : "?",
+        armed,
+        _pendingTopLevelReauth ? _pendingTopLevelReauth.tabId : "none",
+        _armedPopupTabId,
+        Math.max(0, Math.round((_armedPopupWindowUntil - Date.now()) / 1000)) +
+          "s",
+        Boolean(m365AutoLoginEnabled),
+        Boolean(m365AutoLoginPaused),
+        Boolean(m365AutoLoginPassword),
+      );
+      if (!armed) {
         return {
-          enabled: Boolean(m365AutoLoginEnabled),
-          rememberOnManualLogin: Boolean(
-            m365AutoLoginEnabled && m365AutoLoginRemember,
-          ),
+          enabled: false,
+          rememberOnManualLogin: false,
           paused: Boolean(m365AutoLoginPaused),
-          armed: true,
-          tenantId: _tid,
-          username: allowFill ? m365AutoLoginUsername : "",
-          password: allowFill ? m365AutoLoginPassword : "",
+          armed: false,
         };
-      },
-    );
+      }
+      const allowFill = Boolean(m365AutoLoginEnabled && !m365AutoLoginPaused);
+      return {
+        enabled: Boolean(m365AutoLoginEnabled),
+        rememberOnManualLogin: Boolean(
+          m365AutoLoginEnabled && m365AutoLoginRemember,
+        ),
+        paused: Boolean(m365AutoLoginPaused),
+        armed: true,
+        tenantId: _tid,
+        username: allowFill ? m365AutoLoginUsername : "",
+        password: allowFill ? m365AutoLoginPassword : "",
+      };
+    });
   }
   if (message.type === "POPUP_SAVE_M365_AUTO_LOGIN") {
     return (async () => {
@@ -1134,12 +1142,13 @@ browser.runtime.onMessage.addListener((message, sender) => {
       if (message.unpause !== false && m365AutoLoginEnabled) {
         await resetM365ReauthState("auto-login settings saved");
         if (m365ReauthRequired || m365ReauthState !== "none") {
-          tryTopLevelSilentReauth("popup-saved-password", { force: true }).catch(
-            (error) =>
-              log(
-                "M365 reauth from popup-saved-password failed:",
-                compactError(error),
-              ),
+          tryTopLevelSilentReauth("popup-saved-password", {
+            force: true,
+          }).catch((error) =>
+            log(
+              "M365 reauth from popup-saved-password failed:",
+              compactError(error),
+            ),
           );
         }
       }
@@ -1470,7 +1479,11 @@ let _armedPopupWindowUntil = 0;
 // auto-login silently stopped filling it.
 const M365_ARMED_TAB_TTL_MS = 5 * 60 * 1000;
 const _armedLoginTabs = new Map();
-function armM365LoginTab(tabId, now = Date.now(), ttlMs = M365_ARMED_TAB_TTL_MS) {
+function armM365LoginTab(
+  tabId,
+  now = Date.now(),
+  ttlMs = M365_ARMED_TAB_TTL_MS,
+) {
   if (tabId == null) return;
   _armedLoginTabs.set(tabId, now + ttlMs);
   _armedPopupTabId = tabId;
@@ -1555,7 +1568,9 @@ function pushLogRing(line) {
 }
 const log = (...args) => {
   try {
-    pushLogRing(new Date().toISOString().slice(11, 23) + " " + formatLogArgs(args));
+    pushLogRing(
+      new Date().toISOString().slice(11, 23) + " " + formatLogArgs(args),
+    );
   } catch (_) {}
   console.log("[VE-m365-bg]", ...args);
 };
@@ -1678,8 +1693,7 @@ async function loadM365AutoLogin() {
 
 function ensureM365AutoLoginLoaded() {
   if (m365AutoLoginLoaded) return Promise.resolve();
-  if (!m365AutoLoginLoadPromise)
-    m365AutoLoginLoadPromise = loadM365AutoLogin();
+  if (!m365AutoLoginLoadPromise) m365AutoLoginLoadPromise = loadM365AutoLogin();
   return m365AutoLoginLoadPromise;
 }
 
@@ -1721,8 +1735,7 @@ function isSenderArmedM365LoginTab(sender, message) {
   if (
     _pendingTopLevelReauth &&
     _pendingTopLevelReauth.tabId === tabId &&
-    now - Number(_pendingTopLevelReauth.startedAt || 0) <
-      M365_ARMED_TAB_TTL_MS
+    now - Number(_pendingTopLevelReauth.startedAt || 0) < M365_ARMED_TAB_TTL_MS
   ) {
     armM365LoginTab(tabId, now);
     return true;
@@ -1763,11 +1776,11 @@ function isSenderArmedM365LoginTab(sender, message) {
   const pathTid = pathTidMatch ? pathTidMatch[1].toLowerCase() : "";
   const tenantMatches = Boolean(
     pathTid &&
-      (_tid
-        ? pathTid === _tid.toLowerCase()
-        : pathTid === "organizations" ||
-          pathTid === "common" ||
-          /^[0-9a-f-]{36}$/.test(pathTid)),
+    (_tid
+      ? pathTid === _tid.toLowerCase()
+      : pathTid === "organizations" ||
+        pathTid === "common" ||
+        /^[0-9a-f-]{36}$/.test(pathTid)),
   );
   if (pathTidMatch && isM365Client && tenantMatches) {
     const cfgUser = String((message && message.cfgUsername) || "")
@@ -1922,11 +1935,7 @@ async function applyCapturedM365Auth(captured) {
   const capturedTid = String(captured.tenantId || "");
   // A token request from a *different* tenant/identity must never overwrite the
   // bound session or its tokenContext.
-  if (
-    _tid &&
-    capturedTid &&
-    capturedTid.toLowerCase() !== _tid.toLowerCase()
-  ) {
+  if (_tid && capturedTid && capturedTid.toLowerCase() !== _tid.toLowerCase()) {
     log(
       "M365 capture: ignored Sydney credentials from foreign tenant %s (bound=%s client=%s)",
       shortTid(capturedTid),
@@ -1949,8 +1958,8 @@ async function applyCapturedM365Auth(captured) {
   const previousTid = _tid;
   const tenantChanged = Boolean(
     previousTid &&
-      capturedTid &&
-      previousTid.toLowerCase() !== capturedTid.toLowerCase(),
+    capturedTid &&
+    previousTid.toLowerCase() !== capturedTid.toLowerCase(),
   );
   _tid = capturedTid || _tid;
   _clientId = captured.clientId;
@@ -2048,7 +2057,10 @@ browser.webRequest.onBeforeRequest.addListener(
                 requestStartedAt: Number(details.timeStamp || 0),
                 capturedAt: Date.now(),
               }).catch((err) => {
-                log("filterResponseData M365 token apply error:", compactError(err));
+                log(
+                  "filterResponseData M365 token apply error:",
+                  compactError(err),
+                );
               });
             }
           } catch (_) {
@@ -2132,8 +2144,8 @@ async function applyM365TokenResponse(message) {
   }
   const identityMismatch = Boolean(
     claimTid &&
-      !wildcardTenant &&
-      claimTid.toLowerCase() !== tenantId.toLowerCase(),
+    !wildcardTenant &&
+    claimTid.toLowerCase() !== tenantId.toLowerCase(),
   );
   if (identityMismatch) {
     const adopt = Boolean(message.adoptIdentity) || source === "pkce";
@@ -2222,7 +2234,9 @@ async function applyM365TokenResponse(message) {
         m365AutoLoginUsername = _stagedAutoLoginCreds.username;
         dirty = true;
       }
-      log("verified and saved M365 auto-login password from successful sign-in");
+      log(
+        "verified and saved M365 auto-login password from successful sign-in",
+      );
     }
     _stagedAutoLoginCreds = null;
     // Only a real fresh sign-in (authorization_code) may lift the auto-login
@@ -2821,7 +2835,11 @@ function markM365ReauthRequired(reason) {
 
 function clearM365ReauthRequired() {
   if (!m365ReauthRequired && !m365ReauthReason) return;
-  log("M365 left NEEDS_REAUTH state (was: %s) — %s", m365ReauthReason || "-", m365StateLine());
+  log(
+    "M365 left NEEDS_REAUTH state (was: %s) — %s",
+    m365ReauthReason || "-",
+    m365StateLine(),
+  );
   m365ReauthRequired = false;
   m365ReauthReason = "";
   m365ReauthRequiredAt = 0;
@@ -2832,7 +2850,9 @@ function clearM365ReauthRequired() {
 }
 
 function handleRefreshTokenExhausted(payload) {
-  const desc = String(payload && (payload.error_description || payload.error || ""));
+  const desc = String(
+    payload && (payload.error_description || payload.error || ""),
+  );
   const codeMatch = desc.match(/AADSTS\d+/i);
   const code = codeMatch ? codeMatch[0].toUpperCase() : "";
   // Only these two codes really mean "the 24h SPA refresh token is dead".
@@ -2863,7 +2883,10 @@ function base64UrlEncodeBytes(bytes) {
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 async function createPkcePair() {
@@ -2953,7 +2976,10 @@ async function runPageTokenProbe() {
     log("M365 probe: skipped, credentials not captured yet");
     return 0;
   }
-  const template = Object.assign({}, (_m365TokenContext && _m365TokenContext.body) || {});
+  const template = Object.assign(
+    {},
+    (_m365TokenContext && _m365TokenContext.body) || {},
+  );
   for (const key of ["code", "code_verifier", "refresh_token", "grant_type"]) {
     delete template[key];
   }
@@ -2961,8 +2987,12 @@ async function runPageTokenProbe() {
   // a context that lacks the broker pair cannot tell us what the page really
   // sends, so the probe stays silent instead of inventing parameters (that
   // "invented" body is what poisons the cache with AADSTS50011).
-  const missing = ["redirect_uri", "brk_client_id", "brk_redirect_uri", "scope"]
-    .filter((key) => !String(template[key] || "").trim());
+  const missing = [
+    "redirect_uri",
+    "brk_client_id",
+    "brk_redirect_uri",
+    "scope",
+  ].filter((key) => !String(template[key] || "").trim());
   if (missing.length) {
     log(
       "M365 probe: skipped, the captured page request is missing %s",
@@ -3079,9 +3109,7 @@ async function loadM365ReauthState() {
     const stored = await browser.storage.local.get(M365_REAUTH_STATE_KEY);
     const saved = stored[M365_REAUTH_STATE_KEY] || {};
     const status = String(saved.status || "none");
-    m365ReauthState = ["none", "attempting", "terminal"].includes(
-      status,
-    )
+    m365ReauthState = ["none", "attempting", "terminal"].includes(status)
       ? status
       : "none";
     m365ReauthStateReason = String(saved.reason || "");
@@ -3228,10 +3256,13 @@ async function restorePendingReauth() {
       log("discarded stale pending M365 reauth (%dms old)", age);
       return false;
     }
-    const timer = setTimeout(() => {
-      log("restored M365 reauth tab timed out; failing tab %s", saved.tabId);
-      failPendingReauth("restored login tab timed out");
-    }, Math.max(5000, M365_REAUTH_TAB_TIMEOUT_MS - age));
+    const timer = setTimeout(
+      () => {
+        log("restored M365 reauth tab timed out; failing tab %s", saved.tabId);
+        failPendingReauth("restored login tab timed out");
+      },
+      Math.max(5000, M365_REAUTH_TAB_TIMEOUT_MS - age),
+    );
     _pendingTopLevelReauth = {
       tabId: saved.tabId,
       windowId: saved.windowId != null ? saved.windowId : null,
@@ -3627,12 +3658,18 @@ async function tryTopLevelSilentReauth(reason = "scheduled", options = {}) {
           tabId = tabs[0] && tabs[0].id != null ? tabs[0].id : null;
         }
       } catch (error) {
-        log("M365 reauth: popup window failed, falling back to a tab:", compactError(error));
+        log(
+          "M365 reauth: popup window failed, falling back to a tab:",
+          compactError(error),
+        );
         windowId = null;
       }
     }
     if (tabId == null) {
-      const tab = await browser.tabs.create({ url: authUrl.href, active: true });
+      const tab = await browser.tabs.create({
+        url: authUrl.href,
+        active: true,
+      });
       tabId = tab && tab.id != null ? tab.id : null;
       windowId = null;
       if (tabId != null) {
@@ -3667,7 +3704,9 @@ async function tryTopLevelSilentReauth(reason = "scheduled", options = {}) {
         tabId,
         M365_REAUTH_TAB_TIMEOUT_MS,
       );
-      failPendingReauth("login tab timed out after " + M365_REAUTH_TAB_TIMEOUT_MS + "ms");
+      failPendingReauth(
+        "login tab timed out after " + M365_REAUTH_TAB_TIMEOUT_MS + "ms",
+      );
     }, M365_REAUTH_TAB_TIMEOUT_MS);
     _pendingTopLevelReauth = {
       tabId,
@@ -3757,7 +3796,11 @@ async function handleM365AutoLoginResult(message, sender) {
       m365AutoLoginLastError = errMsg;
       m365AutoLoginLastErrorAt = Date.now();
       await saveM365AutoLogin();
-      log("M365 auto-login paused due to fatal error (%s): %s", errCode, errMsg);
+      log(
+        "M365 auto-login paused due to fatal error (%s): %s",
+        errCode,
+        errMsg,
+      );
       await failM365Reauth("fatal " + errCode + ": " + errMsg.slice(0, 120));
       return;
     }
@@ -3770,7 +3813,8 @@ async function handleM365AutoLoginResult(message, sender) {
         "M365 auto-login: browser password manager did not fill #i0118 (%s) — failing, no manual takeover",
         errCode,
       );
-      if (isOurTab) await failPendingReauth("no password filled by the password manager");
+      if (isOurTab)
+        await failPendingReauth("no password filled by the password manager");
       else await failM365Reauth("no-password");
       return;
     }
@@ -3778,7 +3822,11 @@ async function handleM365AutoLoginResult(message, sender) {
     // Fallback: an unclassified failure used to fall through here and change
     // nothing at all, so the loop restarted with zero diagnostics.
     await failM365Reauth(errCode + ": " + errMsg.slice(0, 120));
-    log("M365 auto-login failed without a classified reason (%s): %s", errCode, errMsg);
+    log(
+      "M365 auto-login failed without a classified reason (%s): %s",
+      errCode,
+      errMsg,
+    );
     return;
   }
 
@@ -3891,8 +3939,7 @@ async function handleM365OAuthRedirect(message, sender) {
     .filter(([, value]) => !String(value || "").trim())
     .map(([name]) => name);
   if (missingPending.length) {
-    const detail =
-      "pending reauth is missing " + missingPending.join(", ");
+    const detail = "pending reauth is missing " + missingPending.join(", ");
     log("M365 reauth: cannot exchange the code — %s", detail);
     await failM365Reauth(detail);
     return;
@@ -4129,7 +4176,10 @@ function runPreExpirationRenewal() {
         "M365: local 24h RT countdown is past due (rtRemain=%smin) — proving it with a real refresh before declaring reauth",
         Math.round(rtRemaining / 60000),
       );
-      if (!m365ReauthRequired && _sydney.exp - now > M365_PRE_EXPIRY_WINDOW_MS) {
+      if (
+        !m365ReauthRequired &&
+        _sydney.exp - now > M365_PRE_EXPIRY_WINDOW_MS
+      ) {
         // Force the refresh below to actually hit AAD instead of returning the
         // still-valid cached access token.
         _sydney = { token: "", exp: 0 };
@@ -4236,11 +4286,14 @@ function runPreExpirationRenewal() {
   });
 }
 
-setInterval(() => {
-  runPreExpirationRenewal().catch((error) =>
-    log("pre-expiry renewal loop failed:", compactError(error)),
-  );
-}, 5 * 60 * 1000);
+setInterval(
+  () => {
+    runPreExpirationRenewal().catch((error) =>
+      log("pre-expiry renewal loop failed:", compactError(error)),
+    );
+  },
+  5 * 60 * 1000,
+);
 setTimeout(() => {
   runPreExpirationRenewal().catch(() => {});
 }, 20 * 1000);
@@ -4376,12 +4429,8 @@ function m365Connect() {
     }
     if (message.type === "M365_PAGE_TOKEN_PROBE") {
       runPageTokenProbe()
-        .then((tabs) =>
-          sendM365({ type: "M365_PAGE_TOKEN_PROBE_SENT", tabs }),
-        )
-        .catch((error) =>
-          log("M365 probe failed:", compactError(error)),
-        );
+        .then((tabs) => sendM365({ type: "M365_PAGE_TOKEN_PROBE_SENT", tabs }))
+        .catch((error) => log("M365 probe failed:", compactError(error)));
       return { ok: true };
     }
     if (message.type === "M365_REAUTH_NOW") {
@@ -5235,7 +5284,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
           password: pwd,
           stagedAt: Date.now(),
         };
-        dlog("staged M365 manual login credentials for user=%s", usr || "<unknown>");
+        dlog(
+          "staged M365 manual login credentials for user=%s",
+          usr || "<unknown>",
+        );
       }
       return;
     }
@@ -5310,7 +5362,9 @@ browser.runtime.onMessage.addListener((message, sender) => {
           await refreshSydney(0);
           // Still alive: push the (rotated) RT so the page retries with it.
           await pingM365TabsKeepAlive({ authHealthy: true });
-          log("M365 page RT verified alive after rejection; pushed fresh RT to pages");
+          log(
+            "M365 page RT verified alive after rejection; pushed fresh RT to pages",
+          );
         })()
           .catch((error) =>
             log(
@@ -5354,9 +5408,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
       const rtHealthy = !_rtExp || _rtExp - now > 5 * 60 * 1000;
       const sydneyHealthy = Boolean(_sydney.token && _sydney.exp - now > 60000);
       if (!m365ReauthRequired && rtHealthy && sydneyHealthy) {
-        pingM365TabsKeepAlive({ authHealthy: true, suppressPopups: true }).catch(
-          () => {},
-        );
+        pingM365TabsKeepAlive({
+          authHealthy: true,
+          suppressPopups: true,
+        }).catch(() => {});
         return;
       }
       // An OWA-driven authorize popup is never useful: it is the same silent
@@ -5372,7 +5427,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
           "OWA 触发登录弹窗 (24h 令牌到期)，需重新输入密码登录",
         );
       } else {
-        dlog("M365 popup intercepted while already in NEEDS_REAUTH (%s)", action);
+        dlog(
+          "M365 popup intercepted while already in NEEDS_REAUTH (%s)",
+          action,
+        );
       }
       return;
     }
@@ -5396,10 +5454,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
     if (message.type === "M365_SESSION_RENEW_FAILED") {
       m365LastKeepAliveError = String(message.error || "network/offline");
       m365LastKeepAliveErrorAt = Number(message.at || Date.now());
-      log(
-        "M365 ABT session renew failed: %s",
-        m365LastKeepAliveError,
-      );
+      log("M365 ABT session renew failed: %s", m365LastKeepAliveError);
       schedulePreExpiryRetry("m365-abt");
       return;
     }

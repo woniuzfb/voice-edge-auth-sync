@@ -1,120 +1,120 @@
 name: Build & release extension
 
 on:
-    push:
-        tags:
-            - "v*"
-    workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 jobs:
-    # Single owner for release creation: concurrent "gh release create"
-    # calls race and end up with duplicate draft releases.
-    prepare-release:
+  # Single owner for release creation: concurrent "gh release create"
+  # calls race and end up with duplicate draft releases.
+  prepare-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Idempotent: falls back to view when the release already
+        # exists (e.g. re-pushed tag after a failed attempt).
+        run: |
+          gh release create "${{ github.ref_name }}" --draft \
+              --generate-notes -R "$GITHUB_REPOSITORY" \
+              || gh release view "${{ github.ref_name }}" -R "$GITHUB_REPOSITORY"
+
+  build-extension:
+    needs: prepare-release
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+
+      - run: npm ci
+
+      # Version lives in manifest.base.json (merged into every target by
+      # build.mjs). AMO refuses to sign the same version twice, so a
+      # mismatched tag must be rejected before signing consumes it.
+      - name: Verify tag matches manifest version
         if: startsWith(github.ref, 'refs/tags/')
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
+        run: |
+          VERSION=$(node -p "require('./manifest.base.json').version")
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match extension version v$VERSION"
+            exit 1
+          fi
 
-        steps:
-            - env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              # Idempotent: falls back to view when the release already
-              # exists (e.g. re-pushed tag after a failed attempt).
-              run: |
-                  gh release create "${{ github.ref_name }}" --draft \
-                      --generate-notes -R "$GITHUB_REPOSITORY" \
-                      || gh release view "${{ github.ref_name }}" -R "$GITHUB_REPOSITORY"
+      # Assemble both targets from the single source tree:
+      #   dist/firefox/                        -> signed below (MV2)
+      #   dist/voice-edge-auth-sync-chrome.zip  -> published as-is (MV3)
+      - name: Build Firefox (MV2) + Chrome (MV3)
+        run: |
+          node build.mjs firefox
+          node build.mjs chrome --zip
 
-    build-extension:
-        needs: prepare-release
-        if: ${{ !failure() && !cancelled() }}
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
-
-        steps:
-            - uses: actions/checkout@v7
-
-            - name: Setup Node.js
-              uses: actions/setup-node@v7
-              with:
-                  node-version: 22.x
-
-            - run: npm ci
-
-            # Version lives in manifest.base.json (merged into every target by
-            # build.mjs). AMO refuses to sign the same version twice, so a
-            # mismatched tag must be rejected before signing consumes it.
-            - name: Verify tag matches manifest version
-              if: startsWith(github.ref, 'refs/tags/')
-              run: |
-                  VERSION=$(node -p "require('./manifest.base.json').version")
-                  if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
-                    echo "::error::Tag $GITHUB_REF_NAME does not match extension version v$VERSION"
-                    exit 1
-                  fi
-
-            # Assemble both targets from the single source tree:
-            #   dist/firefox/                        -> signed below (MV2)
-            #   dist/voice-edge-auth-sync-chrome.zip  -> published as-is (MV3)
-            - name: Build Firefox (MV2) + Chrome (MV3)
-              run: |
-                  node build.mjs firefox
-                  node build.mjs chrome --zip
-
-            - name: Sign Firefox extension (AMO, self-hosted / unlisted)
-              if: startsWith(github.ref, 'refs/tags/')
-              env:
-                  WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
-                  WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
-              run: |
-                  if [ -z "$WEB_EXT_API_KEY" ] || [ -z "$WEB_EXT_API_SECRET" ]; then
-                    echo "::error::Set the AMO_API_KEY / AMO_API_SECRET repository secrets (create a key at https://addons.mozilla.org/developers/addon/api/key/)"
-                    exit 1
-                  fi
-                  # Call sign.mjs directly rather than `npm run sign`: the build
-                  # step above already produced dist/firefox, and `npm run sign`
-                  # would rebuild it a second time. sign.mjs still guards for a
-                  # missing dist/firefox, so this stays safe.
-                  node bin/sign.mjs
-
-            # Name both artifacts after the project + version. AMO names the
-            # signed file after the add-on's internal ID, so rename it too.
-            - name: Stage release artifacts
-              if: startsWith(github.ref, 'refs/tags/')
-              run: |
-                  VERSION=$(node -p "require('./manifest.base.json').version")
-                  mkdir -p release
-                  cp dist/signed/*.xpi "release/voice-edge-auth-sync-${VERSION}-firefox.xpi"
-                  cp "dist/voice-edge-auth-sync-chrome.zip" "release/voice-edge-auth-sync-${VERSION}-chrome.zip"
-
-            # Signing consumes the AMO version, so publishing only runs for
-            # tag pushes (manual dispatch builds but never signs/publishes).
-            - uses: actions/upload-artifact@v7
-              if: startsWith(github.ref, 'refs/tags/')
-              with:
-                  name: voice-edge-auth-sync-release
-                  path: release/*
-
-            - name: Publish Firefox (signed) + Chrome (unsigned) to release
-              if: startsWith(github.ref, 'refs/tags/')
-              env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-                  RELEASE_TAG: ${{ github.ref_name }}
-              run: |
-                  gh release upload "$RELEASE_TAG" release/*.xpi release/*.zip \
-                      --clobber -R "$GITHUB_REPOSITORY"
-
-    publish:
-        needs: [build-extension]
+      - name: Sign Firefox extension (AMO, self-hosted / unlisted)
         if: startsWith(github.ref, 'refs/tags/')
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+        run: |
+          if [ -z "$WEB_EXT_API_KEY" ] || [ -z "$WEB_EXT_API_SECRET" ]; then
+            echo "::error::Set the AMO_API_KEY / AMO_API_SECRET repository secrets (create a key at https://addons.mozilla.org/developers/addon/api/key/)"
+            exit 1
+          fi
+          # Call sign.mjs directly rather than `npm run sign`: the build
+          # step above already produced dist/firefox, and `npm run sign`
+          # would rebuild it a second time. sign.mjs still guards for a
+          # missing dist/firefox, so this stays safe.
+          node bin/sign.mjs
 
-        steps:
-            # Assets are uploaded to a draft while the build runs; publish
-            # it once everything has succeeded.
-            - env:
-                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: gh release edit "${{ github.ref_name }}" --draft=false -R "$GITHUB_REPOSITORY"
+      # Name both artifacts after the project + version. AMO names the
+      # signed file after the add-on's internal ID, so rename it too.
+      - name: Stage release artifacts
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION=$(node -p "require('./manifest.base.json').version")
+          mkdir -p release
+          cp dist/signed/*.xpi "release/voice-edge-auth-sync-${VERSION}-firefox.xpi"
+          cp "dist/voice-edge-auth-sync-chrome.zip" "release/voice-edge-auth-sync-${VERSION}-chrome.zip"
+
+      # Signing consumes the AMO version, so publishing only runs for
+      # tag pushes (manual dispatch builds but never signs/publishes).
+      - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: voice-edge-auth-sync-release
+          path: release/*
+
+      - name: Publish Firefox (signed) + Chrome (unsigned) to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" release/*.xpi release/*.zip \
+              --clobber -R "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [build-extension]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # Assets are uploaded to a draft while the build runs; publish
+      # it once everything has succeeded.
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false -R "$GITHUB_REPOSITORY"

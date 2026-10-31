@@ -8,6 +8,7 @@
  *   node build.mjs chrome --zip    # build + zip
  *   node build.mjs all --zip       # build both + zip each
  *   node build.mjs --no-clean      # keep dist/ contents, only overwrite
+ *   node build.mjs --no-format     # skip Prettier formatting before build
  *
  * Layout:
  *   src/                     shared source (background.js is platform-neutral)
@@ -139,6 +140,21 @@ function zip(target, outDir) {
   return zipPath;
 }
 
+function formatRepo() {
+  if (process.argv.includes("--no-format")) return;
+  const bin = join(
+    ROOT,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "prettier.cmd" : "prettier",
+  );
+  if (!existsSync(bin)) return;
+  const mode = process.argv.includes("--check-format")
+    ? "--check"
+    : "--write --log-level warn";
+  execSync(`"${bin}" ${mode} .`, { cwd: ROOT, stdio: "inherit" });
+}
+
 function main() {
   const args = process.argv.slice(2);
   const doZip = args.includes("--zip");
@@ -146,6 +162,7 @@ function main() {
   let targets = positional.length ? positional : ["all"];
   if (targets.includes("all")) targets = ["firefox", "chrome"];
 
+  formatRepo();
   mkdirSync(DIST, { recursive: true });
   for (const t of targets) {
     const res = build(t);

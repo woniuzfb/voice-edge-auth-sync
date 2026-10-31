@@ -36,7 +36,7 @@
             completedAt: Date.now(),
             body: body,
           },
-          "*"
+          "*",
         );
       } catch (_) {}
     }
@@ -47,11 +47,9 @@
       if (typeof origFetch === "function" && !origFetch.__veHooked) {
         var hookedFetch = function (input, init) {
           var url =
-            typeof input === "string"
-              ? input
-              : (input && input.url) || "";
+            typeof input === "string" ? input : (input && input.url) || "";
           var method = String(
-            (init && init.method) || (input && input.method) || "GET"
+            (init && init.method) || (input && input.method) || "GET",
           ).toUpperCase();
           var startedAt = Date.now();
           var p = origFetch.apply(this, arguments);
@@ -89,7 +87,7 @@
                       }
                       pump();
                     },
-                    function () {}
+                    function () {},
                   );
                 }
                 pump();

@@ -263,10 +263,7 @@
       );
     let exp = Date.now() + 50 * 60 * 1000;
     try {
-      const part = rawToken
-        .split(".")[1]
-        .replace(/-/g, "+")
-        .replace(/_/g, "/");
+      const part = rawToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
       const claims = JSON.parse(
         atob(part.padEnd(Math.ceil(part.length / 4) * 4, "=")),
       );
@@ -900,7 +897,9 @@
       } catch (digestError) {
         _lastSpRenewAt = 0;
         const errMsg = String(
-          (digestError && digestError.message) || digestError || "digest failed",
+          (digestError && digestError.message) ||
+            digestError ||
+            "digest failed",
         );
         scheduleSpRenewRetry(siteUrl, errMsg);
         browser.runtime

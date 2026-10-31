@@ -99,7 +99,8 @@ const SEED_CONTEXT = {
   body: {
     client_id: CLIENT_ID,
     redirect_uri: BROKER_REDIRECT,
-    scope: "https://substrate.office.com/sydney/.default openid profile offline_access",
+    scope:
+      "https://substrate.office.com/sydney/.default openid profile offline_access",
     brk_client_id: BRK_CLIENT_ID,
     brk_redirect_uri: WEB_REDIRECT,
     login_hint: "user@contoso.com",
@@ -553,7 +554,10 @@ class MockLoginWindow {
     // interaction_required（由后台升级一次交互式页面）。
     this.finalRedirect =
       url.searchParams.get("brk_redirect_uri") || REDIRECT_URI;
-    if (url.searchParams.get("prompt") === "none" && !this.scenario.silentFails) {
+    if (
+      url.searchParams.get("prompt") === "none" &&
+      !this.scenario.silentFails
+    ) {
       this._later(() => this._redirect(), 60);
       return;
     }
@@ -1138,9 +1142,15 @@ async function main() {
     { sso: "expired", silentFails: true, autofill: { mode: "immediate" } },
     async (h) => {
       await h.bg.run(`return await tryTopLevelSilentReauth("e2e");`);
-      const snap = await h.waitFor((s) => s.state === "none" && s.rt === "rotated-rt");
+      const snap = await h.waitFor(
+        (s) => s.state === "none" && s.rt === "rotated-rt",
+      );
       const tabs = h.state.createdTabs;
-      check("先静默、再交互，共 2 个标签页", tabs.length === 2, `tabs=${tabs.length}`);
+      check(
+        "先静默、再交互，共 2 个标签页",
+        tabs.length === 2,
+        `tabs=${tabs.length}`,
+      );
       check(
         "第一个是 prompt=none",
         tabs[0] && /prompt=none/.test(tabs[0].url),
@@ -1160,8 +1170,12 @@ async function main() {
     "AAD 拒绝未注册的 redirect_uri (50011) → 快速失败，不空等 45 秒",
     { sso: "expired", forceAadError: "50011" },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
-      const snap = await h.waitFor((s) => s.state === "terminal", { timeout: 8000 });
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
+      const snap = await h.waitFor((s) => s.state === "terminal", {
+        timeout: 8000,
+      });
       check("进入 terminal", snap.state === "terminal", snap.reason);
       check("原因里带 AADSTS50011", /50011/.test(snap.reason), snap.reason);
       check("窗口已关闭", snap.openWindows === 0);
@@ -1173,7 +1187,9 @@ async function main() {
     "登录页始终不加载（模拟断网）→ 环境性失败，不消耗唯一尝试",
     { sso: "expired", noPage: true },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor(
         (s) => s.state === "none" && s.openWindows === 0,
         { timeout: 20000 },
@@ -1202,7 +1218,9 @@ async function main() {
     { sso: "expired" },
     async (h) => {
       await h.bg.run(`navigator.onLine = false; return true;`);
-      const started = await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      const started = await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       await sleep(200);
       const snap = await h.snapshot();
       check("没有发起尝试", started === false);
@@ -1220,7 +1238,9 @@ async function main() {
     "3. 会话失效 + 密码库立即填充：窗口内自动填密并提交",
     { sso: "expired", autofill: { mode: "immediate" } },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor(
         (s) => s.state === "none" && s.rt === "rotated-rt",
       );
@@ -1244,7 +1264,9 @@ async function main() {
     "4. 密码库晚 1.2 秒填充：仍在等待窗口内",
     { sso: "expired", autofill: { mode: "delay", delayMs: 1200 } },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor(
         (s) => s.state === "none" && s.rt === "rotated-rt",
       );
@@ -1263,7 +1285,9 @@ async function main() {
     "5. 密码库始终不填充 → 失败、关窗、通知（禁止人工输入）",
     { sso: "expired", autofill: { mode: "never" } },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor((s) => s.state === "terminal", {
         timeout: 12000,
       });
@@ -1299,7 +1323,9 @@ async function main() {
       fillValue: "wrong-password",
     },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor((s) => s.state === "terminal");
       check("进入 terminal", snap.state === "terminal", snap.reason);
       check("原因含 AADSTS50126", /50126/.test(snap.reason), snap.reason);
@@ -1317,7 +1343,9 @@ async function main() {
     "7. 需要 MFA：终态 + 关窗 + 通知（没人会去点批准）",
     { sso: "expired", autofill: { mode: "immediate" }, mfa: true },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor((s) => s.state === "terminal");
       check("进入 terminal", snap.state === "terminal", snap.reason);
       check(
@@ -1337,7 +1365,9 @@ async function main() {
     "8. AAD 直接回 interaction_required：一次即终态",
     { sso: "interaction_required" },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor((s) => s.state === "terminal", {
         timeout: 8000,
       });
@@ -1356,7 +1386,9 @@ async function main() {
     "9. 账号选择器 → 密码页：整条链路走通",
     { sso: "expired", picker: true, autofill: { mode: "immediate" } },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const snap = await h.waitFor(
         (s) => s.state === "none" && s.rt === "rotated-rt",
       );
@@ -1375,7 +1407,9 @@ async function main() {
     "10. 登录页被关闭：终态，之后不再自动开窗",
     { sso: "expired", autofill: { mode: "never" } },
     async (h) => {
-      await h.bg.run(`return await tryTopLevelSilentReauth("e2e", { interactive: true });`);
+      await h.bg.run(
+        `return await tryTopLevelSilentReauth("e2e", { interactive: true });`,
+      );
       const opened = await h.waitFor((s) => s.openWindows === 1);
       await h.stub.removeTab(
         await h.bg.run(`return _pendingTopLevelReauth.tabId;`),
@@ -1433,18 +1467,29 @@ async function main() {
         force: true,
         requestId: "harness-test-1",
       });
-      const snap = await h.waitFor((s) => s.rt === "rotated-rt", { timeout: 15000 });
-      check("收到命令后真的换了新 RT", snap.rt === "rotated-rt", `rt=${snap.rt}`);
+      const snap = await h.waitFor((s) => s.rt === "rotated-rt", {
+        timeout: 15000,
+      });
+      check(
+        "收到命令后真的换了新 RT",
+        snap.rt === "rotated-rt",
+        `rt=${snap.rt}`,
+      );
 
       const startedAt = Date.now();
-      while (Date.now() - startedAt < 8000 && !h.bridge.sent("M365_REAUTH_DONE").length) {
+      while (
+        Date.now() - startedAt < 8000 &&
+        !h.bridge.sent("M365_REAUTH_DONE").length
+      ) {
         await sleep(100);
       }
       const started = h.bridge.sent("M365_REAUTH_STARTED")[0];
       const done = h.bridge.sent("M365_REAUTH_DONE")[0];
       check(
         "回了 M365_REAUTH_STARTED（带 requestId）",
-        started && started.requestId === "harness-test-1" && started.started === true,
+        started &&
+          started.requestId === "harness-test-1" &&
+          started.started === true,
         JSON.stringify(started),
       );
       check(
@@ -1455,8 +1500,12 @@ async function main() {
       check(
         "DONE 里带后台日志（含 renewed 24h）",
         Array.isArray(done && done.log) &&
-          done.log.some((line) => /renewed 24h M365 SPA refresh token/.test(line)),
-        done && Array.isArray(done.log) ? String(done.log.length) + " lines" : "no log",
+          done.log.some((line) =>
+            /renewed 24h M365 SPA refresh token/.test(line),
+          ),
+        done && Array.isArray(done.log)
+          ? String(done.log.length) + " lines"
+          : "no log",
       );
     },
   );
@@ -1576,7 +1625,10 @@ async function main() {
     );
     await w.fetch(
       `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token`,
-      { method: "POST", body: `client_id=other&grant_type=refresh_token&refresh_token=OLD-RT` },
+      {
+        method: "POST",
+        body: `client_id=other&grant_type=refresh_token&refresh_token=OLD-RT`,
+      },
     );
     check(
       "client_id 不匹配时不改写",
@@ -1604,7 +1656,9 @@ async function main() {
     });
     check(
       "第一次仍会换（就是它被拒的）",
-      String((calls.at(-1) || {}).body || "").includes("refresh_token=REJECTED-RT"),
+      String((calls.at(-1) || {}).body || "").includes(
+        "refresh_token=REJECTED-RT",
+      ),
       String((calls.at(-1) || {}).body || "").slice(0, 120),
     );
     // 被拒之后也不回退：下一次照样换成我们这条（旧 RT 一律不用）
@@ -1614,7 +1668,9 @@ async function main() {
     });
     check(
       "被拒后仍然只用自己的 RT（不回退旧 RT）",
-      String((calls.at(-1) || {}).body || "").includes("refresh_token=REJECTED-RT"),
+      String((calls.at(-1) || {}).body || "").includes(
+        "refresh_token=REJECTED-RT",
+      ),
       String((calls.at(-1) || {}).body || "").slice(0, 120),
     );
     await sleep(80);
@@ -1731,17 +1787,27 @@ async function main() {
         `return await tryTopLevelSilentReauth("missing-capture");`,
       );
       const snap = await h.waitFor((s) => s.state === "terminal");
-      check("没有为此打开任何登录窗口", h.state.createdTabs.length === 0,
-        `tabs=${h.state.createdTabs.length}`);
-      check("调用方拿到 false（没有假装开始）", started === false, `started=${started}`);
+      check(
+        "没有为此打开任何登录窗口",
+        h.state.createdTabs.length === 0,
+        `tabs=${h.state.createdTabs.length}`,
+      );
+      check(
+        "调用方拿到 false（没有假装开始）",
+        started === false,
+        `started=${started}`,
+      );
       check(
         "失败原因点名缺的两个 broker 参数",
-        /brk_client_id/.test(snap.reason) && /brk_redirect_uri/.test(snap.reason),
+        /brk_client_id/.test(snap.reason) &&
+          /brk_redirect_uri/.test(snap.reason),
         snap.reason,
       );
       check(
         "日志里没有借用任何硬编码值",
-        !h.net.calls.some((c) => String(c.url || "").includes("brk-multihub://")),
+        !h.net.calls.some((c) =>
+          String(c.url || "").includes("brk-multihub://"),
+        ),
         JSON.stringify(h.net.calls.map((c) => c.url).slice(0, 3)),
       );
     },
@@ -1792,25 +1858,54 @@ async function main() {
         return true;
       `);
       const r1 = await apply(CLIENT_ID, sibling, "sibling-rt");
-      check("同 clientId 的兄弟轮换被采纳（_rt 更新）", r1.rt === "sibling-rt", `rt=${r1.rt}`);
+      check(
+        "同 clientId 的兄弟轮换被采纳（_rt 更新）",
+        r1.rt === "sibling-rt",
+        `rt=${r1.rt}`,
+      );
       check(
         "未知初值被夹到 24h 以内（30 天策略不会污染倒计时）",
         r1.rtExp - Date.now() <= 24 * 3600 * 1000 + 5000,
         `remainMin=${Math.round((r1.rtExp - Date.now()) / 60000)}`,
       );
-      check("没有直接清 reauth 标（清标只认真刷出来的 sydney 令牌）", r1.reauth === true, `reauth=${r1.reauth}`);
-      check("把 _sydney 置空，逼下一轮真刷", r1.sydney === "", `sydney=${r1.sydney}`);
-      const r2 = await apply("00000000-0000-0000-0000-000000000000", sibling, "foreign-rt");
-      check("不同 clientId 的兄弟轮换被忽略", r2.rt === "sibling-rt", `rt=${r2.rt}`);
+      check(
+        "没有直接清 reauth 标（清标只认真刷出来的 sydney 令牌）",
+        r1.reauth === true,
+        `reauth=${r1.reauth}`,
+      );
+      check(
+        "把 _sydney 置空，逼下一轮真刷",
+        r1.sydney === "",
+        `sydney=${r1.sydney}`,
+      );
+      const r2 = await apply(
+        "00000000-0000-0000-0000-000000000000",
+        sibling,
+        "foreign-rt",
+      );
+      check(
+        "不同 clientId 的兄弟轮换被忽略",
+        r2.rt === "sibling-rt",
+        `rt=${r2.rt}`,
+      );
       const r3 = await apply(CLIENT_ID, sibling, "duplicate-rt");
-      check("同一条 accessToken 第二次到达被去重（双通道不重复写）", r3.rt === "sibling-rt", `rt=${r3.rt}`);
+      check(
+        "同一条 accessToken 第二次到达被去重（双通道不重复写）",
+        r3.rt === "sibling-rt",
+        `rt=${r3.rt}`,
+      );
       const sibB = token("https://clients.config.office.net");
       await apply(CLIENT_ID, sibB, "sibling-b-rt");
-      const rInterleavedA = await apply(CLIENT_ID, sibling, "interleaved-dup-a");
+      const rInterleavedA = await apply(
+        CLIENT_ID,
+        sibling,
+        "interleaved-dup-a",
+      );
       const rInterleavedB = await apply(CLIENT_ID, sibB, "interleaved-dup-b");
       check(
         "A -> B -> A -> B 双通道交错到达时，A 和 B 的重复副本均被有界 Set 去重",
-        rInterleavedA.rt === "sibling-b-rt" && rInterleavedB.rt === "sibling-b-rt",
+        rInterleavedA.rt === "sibling-b-rt" &&
+          rInterleavedB.rt === "sibling-b-rt",
         `rtA=${rInterleavedA.rt} rtB=${rInterleavedB.rt}`,
       );
       // 有界缓存的淘汰行为：灌满 16 条后，最旧的一条被挤出，再次到达要当新响应处理。
@@ -1897,7 +1992,11 @@ async function main() {
           stagedStillPresent: Boolean(_stagedAutoLoginCreds && _stagedAutoLoginCreds.password === "staged-secret-password"),
         };
       `);
-      check("同 clientId + 非通配符租户的 5 段 JWE 轮换被采纳", rJwe.rt === "jwe-rotated-rt", `rt=${rJwe.rt}`);
+      check(
+        "同 clientId + 非通配符租户的 5 段 JWE 轮换被采纳",
+        rJwe.rt === "jwe-rotated-rt",
+        `rt=${rJwe.rt}`,
+      );
       check(
         "JWE 轮换不落库、也不清空暂存的自动登录密码（身份不可读时不碰身份状态）",
         rJwe.savedPwd === "" && rJwe.stagedStillPresent === true,
@@ -1917,9 +2016,21 @@ async function main() {
         });
         return { rt: _rt };
       `);
-      check("通配符租户（organizations/common）下的 JWE 轮换被拒绝", rJweWildcard.rt === "jwe-rotated-rt", `rt=${rJweWildcard.rt}`);
-      const r4 = await apply(CLIENT_ID, token("https://substrate.office.com/sydney"), "sydney-rt");
-      check("真 Sydney 响应仍然直接落库并清标", r4.rt === "sydney-rt" && r4.reauth === false, `rt=${r4.rt} reauth=${r4.reauth}`);
+      check(
+        "通配符租户（organizations/common）下的 JWE 轮换被拒绝",
+        rJweWildcard.rt === "jwe-rotated-rt",
+        `rt=${rJweWildcard.rt}`,
+      );
+      const r4 = await apply(
+        CLIENT_ID,
+        token("https://substrate.office.com/sydney"),
+        "sydney-rt",
+      );
+      check(
+        "真 Sydney 响应仍然直接落库并清标",
+        r4.rt === "sydney-rt" && r4.reauth === false,
+        `rt=${r4.rt} reauth=${r4.reauth}`,
+      );
 
       // 乱序到达：新一代先落地，旧一代迟到 —— 旧 RT 绝不允许覆盖新一代；
       // 同批并发（250ms 窗口内）放行但水位使用 Math.max 不倒退；
@@ -2155,7 +2266,9 @@ async function main() {
           },
         );
       } finally {
-        capturedDelay = await h.bg.run(`return globalThis.__restoreSetTimeout();`);
+        capturedDelay = await h.bg.run(
+          `return globalThis.__restoreSetTimeout();`,
+        );
       }
       await sleep(160);
       const afterSubmitTimeout = await h.bg.run(`
@@ -2169,7 +2282,9 @@ async function main() {
         "M365_AUTO_LOGIN_SUBMITTING 挂载 25s 定时器且超时后真实回调落入 terminal",
         capturedDelay === 25000 &&
           afterSubmitTimeout.state === "terminal" &&
-          /login tab timed out 25s after submit/.test(afterSubmitTimeout.reason) &&
+          /login tab timed out 25s after submit/.test(
+            afterSubmitTimeout.reason,
+          ) &&
           afterSubmitTimeout.pending === null,
         JSON.stringify({ capturedDelay, ...afterSubmitTimeout }),
       );
@@ -2227,7 +2342,10 @@ async function main() {
             onMessage: { addListener: () => {} },
           },
           storage: {
-            local: { get: () => Promise.resolve({}), set: () => Promise.resolve() },
+            local: {
+              get: () => Promise.resolve({}),
+              set: () => Promise.resolve(),
+            },
           },
         };
         win.eval(readFileSync(join(ROOT, "src/content-m365.js"), "utf8"));
@@ -2931,7 +3049,9 @@ async function liveReauth() {
     } catch (_) {}
     process.exit(3);
   }
-  console.log(`已监听 ${"ws://127.0.0.1:" + PORT + PATH}（复用扩展的既有通道）`);
+  console.log(
+    `已监听 ${"ws://127.0.0.1:" + PORT + PATH}（复用扩展的既有通道）`,
+  );
   console.log("等待扩展连上来…（它自带 1s→30s 退避重连）\n");
 
   let commanded = false;
@@ -2943,7 +3063,9 @@ async function liveReauth() {
   let reloadTried = false;
   const result = await new Promise((resolve, reject) => {
     // probe-only 需要先等浏览器把扩展装好并连上来，不能 90 秒就放弃。
-    const firstWaitMs = process.argv.includes("--probe-only") ? 12 * 60 * 1000 : 90000;
+    const firstWaitMs = process.argv.includes("--probe-only")
+      ? 12 * 60 * 1000
+      : 90000;
     let timer = setTimeout(
       () =>
         reject(
@@ -2981,7 +3103,9 @@ async function liveReauth() {
     };
     wss.on("connection", (ws, req) => {
       activeWs = ws;
-      console.log(`✅ 扩展已连接（${req && req.socket ? req.socket.remotePort : "?"}）`);
+      console.log(
+        `✅ 扩展已连接（${req && req.socket ? req.socket.remotePort : "?"}）`,
+      );
       ws.on("message", (data) => {
         let msg = null;
         try {
@@ -3010,7 +3134,9 @@ async function liveReauth() {
             reloadTried = true;
             commanded = false;
             probeSent = false;
-            console.log("   → 构建不一致，发送 M365_RELOAD_SELF（扩展会自己重启加载新 dist）");
+            console.log(
+              "   → 构建不一致，发送 M365_RELOAD_SELF（扩展会自己重启加载新 dist）",
+            );
             ws.send(JSON.stringify({ type: "M365_RELOAD_SELF" }));
             return;
           }
@@ -3018,7 +3144,9 @@ async function liveReauth() {
           commanded = true;
           if (process.argv.includes("--probe-only")) {
             probeSent = true;
-            console.log("   收到 M365_READY → 跳过续期，直接让页面发一次 /token 探针");
+            console.log(
+              "   收到 M365_READY → 跳过续期，直接让页面发一次 /token 探针",
+            );
             ws.send(JSON.stringify({ type: "M365_PAGE_TOKEN_PROBE" }));
             armProbeWait();
             return;
@@ -3028,7 +3156,11 @@ async function liveReauth() {
           setTimeout(() => {
             try {
               ws.send(
-                JSON.stringify({ type: "M365_REAUTH_NOW", force: true, requestId }),
+                JSON.stringify({
+                  type: "M365_REAUTH_NOW",
+                  force: true,
+                  requestId,
+                }),
               );
             } catch (_) {}
           }, 3000);
@@ -3069,7 +3201,9 @@ async function liveReauth() {
             ws.close();
           } catch (_) {}
         } else if (msg.type === "M365_RELOAD_ACK") {
-          console.log(`   扩展确认重启（旧构建 ${msg.build || "?"}），等它重连…`);
+          console.log(
+            `   扩展确认重启（旧构建 ${msg.build || "?"}），等它重连…`,
+          );
         } else if (msg.type === "M365_PAGE_TOKEN_PROBE_SENT") {
           console.log(`   已投递到 ${msg.tabs} 个 OWA 标签页，等待页面回报…`);
         } else if (msg.type === "M365_PAGE_TOKEN_PROBE_RESULT") {
@@ -3111,7 +3245,8 @@ async function liveReauth() {
   // remaining value proves nothing — the old RT may still have 23h left
   // (a false ✅ used to be printed while the exchange was failing).
   const rtAfter = Number(result.rtExpiresAt || 0);
-  const refreshed = result.state === "none" && rtBefore > 0 && rtAfter - rtBefore > 60000;
+  const refreshed =
+    result.state === "none" && rtBefore > 0 && rtAfter - rtBefore > 60000;
   if (refreshed) {
     console.log(
       `\n✅ 已换取新的 24h RT（剩余 ${result.rtRemainMin} 分钟，到期时间 +${Math.round((rtAfter - rtBefore) / 60000)} 分钟）`,
@@ -3121,7 +3256,9 @@ async function liveReauth() {
   if (result.probe && !result.probe.ok) {
     console.log(
       `\n❌ 页面 /token 没有被正确改写（status=${result.probe.status}, swapped=${result.probe.swapped}）` +
-        (result.probe.error ? `\n   ${String(result.probe.error).slice(0, 200)}` : ""),
+        (result.probe.error
+          ? `\n   ${String(result.probe.error).slice(0, 200)}`
+          : ""),
     );
     process.exit(1);
   }
@@ -3142,7 +3279,10 @@ async function liveReauth() {
 
 if (process.argv.includes("--live")) {
   liveReauth().catch((error) => {
-    console.error("LIVE ERROR:", (error && (error.stack || error.message)) || error);
+    console.error(
+      "LIVE ERROR:",
+      (error && (error.stack || error.message)) || error,
+    );
     process.exit(2);
   });
 } else if (process.argv.includes("--visual")) {

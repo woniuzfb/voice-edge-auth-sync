@@ -8,10 +8,12 @@
     "build": "node build.mjs all",
     "build:firefox": "node build.mjs firefox",
     "build:chrome": "node build.mjs chrome",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "package": "node build.mjs all --zip",
     "package:firefox": "node build.mjs firefox --zip",
     "package:chrome": "node build.mjs chrome --zip",
-    "package:source": "tar --exclude='dist' --exclude='node_modules' --exclude='.git' --exclude='.DS_Store' -czf voice-edge-auth-sync-source.tar.gz src manifest.base.json manifest.firefox.json manifest.chrome.json build.mjs package.json README.md AGENTS.md .github bin test",
+    "package:source": "tar --exclude='dist' --exclude='node_modules' --exclude='.git' --exclude='.DS_Store' -czf voice-edge-auth-sync-source.tar.gz src manifest.base.json manifest.firefox.json manifest.chrome.json build.mjs package.json .prettierrc.json .prettierignore README.md AGENTS.md .github bin test",
     "sign": "node build.mjs firefox && node bin/sign.mjs",
     "release": "tag=${npm_config_tag:?Usage: npm run release --tag=vx.y.z}; git tag \"$tag\" && git push origin \"$tag\"",
     "test:reauth": "node test/reauth.mjs",
@@ -20,6 +22,7 @@
   },
   "devDependencies": {
     "jsdom": "^30.1.3",
+    "prettier": "^3.9.10",
     "web-ext": "^10.6.0",
     "ws": "^8.22.0"
   }

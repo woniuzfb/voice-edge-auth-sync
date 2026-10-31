@@ -47,7 +47,8 @@
       var wrappedMap = new WeakMap();
 
       evt.addListener = function (listener) {
-        if (typeof listener !== "function") return rawAdd.apply(null, arguments);
+        if (typeof listener !== "function")
+          return rawAdd.apply(null, arguments);
         var wrapped = wrappedMap.get(listener);
         if (!wrapped) {
           wrapped = function (message, sender, sendResponse) {
@@ -61,7 +62,9 @@
             if (result && typeof result.then === "function") {
               result.then(
                 function (value) {
-                  try { sendResponse(value); } catch (_) {}
+                  try {
+                    sendResponse(value);
+                  } catch (_) {}
                 },
                 function (err) {
                   try {
@@ -69,13 +72,15 @@
                       __error: String((err && err.message) || err),
                     });
                   } catch (_) {}
-                }
+                },
               );
               return true; // keep the message channel open
             }
             if (result === true) return true; // legacy sendResponse style
             if (typeof result !== "undefined") {
-              try { sendResponse(result); } catch (_) {}
+              try {
+                sendResponse(result);
+              } catch (_) {}
               return false;
             }
             return false; // not handled by this listener

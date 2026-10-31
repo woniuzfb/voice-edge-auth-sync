@@ -184,11 +184,7 @@ function render(state) {
         : sp.readyPageUrl
           ? "页面已就绪"
           : "等待页面",
-    !sp.configured
-      ? "err"
-      : (spr && spr.ok) || sp.readyPageUrl
-        ? "ok"
-        : "warn",
+    !sp.configured ? "err" : (spr && spr.ok) || sp.readyPageUrl ? "ok" : "warn",
   );
   setRow("sp-home-row", "sp-home", sp.homeUrl || "");
   setRow("sp-folder-row", "sp-folder", sp.uploadFolder || "");

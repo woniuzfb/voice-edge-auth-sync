@@ -26,16 +26,16 @@
 
   // Known fatal/interactive AAD error codes mapped to clear human-readable reasons.
   const AAD_ERROR_DESCRIPTIONS = {
-    "50126": "AADSTS50126: 账号或密码错误，已暂停自动登录以防锁号",
-    "50053": "AADSTS50053: 登录尝试次数过多，账户触发锁定保护",
-    "50055": "AADSTS50055: 密码已过期，请手动登录并修改密码",
-    "50057": "AADSTS50057: 用户账户已被禁用",
-    "50072": "AADSTS50072: 需要注册多因素认证 (MFA)",
-    "50074": "AADSTS50074: 强身份验证策略要求二次验证 (MFA)",
-    "50076": "AADSTS50076: 需要完成二次验证 (MFA)",
-    "50079": "AADSTS50079: 需要配置或完成多因素认证 (MFA)",
-    "50105": "AADSTS50105: 当前账户未获授权访问该应用",
-    "53003": "AADSTS53003: 登录被条件访问策略 (Conditional Access) 阻止",
+    50126: "AADSTS50126: 账号或密码错误，已暂停自动登录以防锁号",
+    50053: "AADSTS50053: 登录尝试次数过多，账户触发锁定保护",
+    50055: "AADSTS50055: 密码已过期，请手动登录并修改密码",
+    50057: "AADSTS50057: 用户账户已被禁用",
+    50072: "AADSTS50072: 需要注册多因素认证 (MFA)",
+    50074: "AADSTS50074: 强身份验证策略要求二次验证 (MFA)",
+    50076: "AADSTS50076: 需要完成二次验证 (MFA)",
+    50079: "AADSTS50079: 需要配置或完成多因素认证 (MFA)",
+    50105: "AADSTS50105: 当前账户未获授权访问该应用",
+    53003: "AADSTS53003: 登录被条件访问策略 (Conditional Access) 阻止",
   };
 
   function isVisible(el) {
@@ -135,7 +135,9 @@
     for (const sel of errorSelectors) {
       const el = document.querySelector(sel);
       if (el && isVisible(el)) {
-        const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+        const text = String(el.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
         if (text) {
           const codeMatch = text.match(/AADSTS(\d+)/i);
           const code = codeMatch ? codeMatch[1] : "DOM_ERROR";
@@ -162,7 +164,9 @@
         if (!code || BENIGN_INITIAL_CODES.has(code)) continue;
         const msg =
           AAD_ERROR_DESCRIPTIONS[code] ||
-          String(cfg.sErrTxt || "").replace(/\s+/g, " ").trim() ||
+          String(cfg.sErrTxt || "")
+            .replace(/\s+/g, " ")
+            .trim() ||
           `AAD 登录返回错误码 AADSTS${code}`;
         return {
           failed: true,
@@ -234,7 +238,9 @@
       try {
         const pwd = String(passInput.value || "");
         if (!pwd) return;
-        const userInput = document.querySelector("input[name='loginfmt']#i0116");
+        const userInput = document.querySelector(
+          "input[name='loginfmt']#i0116",
+        );
         const username = String(
           (userInput && userInput.value) || extractCfgUsername(cfg) || "",
         ).trim();
@@ -290,15 +296,16 @@
     };
     return [
       "pgid=" + String((cfg && cfg.pgid) || "-"),
-      "err=" +
-        String(
-          (cfg && (cfg.sErrorCode || cfg.stsErrorCode)) || "-",
+      "err=" + String((cfg && (cfg.sErrorCode || cfg.stsErrorCode)) || "-"),
+      "pass=" +
+        vis(
+          "input[name='passwd']#i0118, input[type='password'][name='passwd']",
         ),
-      "pass=" + vis("input[name='passwd']#i0118, input[type='password'][name='passwd']"),
       "user=" + vis("input[name='loginfmt']#i0116"),
       "tiles=" + vis("#tilesHolder"),
       "kmsi=" + vis("#KmsiCheckboxField, input[name='DontShowAgain']"),
-      "submit=" + vis("#idSIButton9, input[type='submit'], button[type='submit']"),
+      "submit=" +
+        vis("#idSIButton9, input[type='submit'], button[type='submit']"),
     ].join(" ");
   }
 
@@ -436,7 +443,12 @@
     const submitBtn = document.querySelector(
       "#idSIButton9, input[type='submit'], button[type='submit']",
     );
-    if (passInput && isVisible(passInput) && submitBtn && isVisible(submitBtn)) {
+    if (
+      passInput &&
+      isVisible(passInput) &&
+      submitBtn &&
+      isVisible(submitBtn)
+    ) {
       if (readRecentGuard(SUBMIT_GUARD_KEY)) {
         return;
       }
@@ -502,7 +514,11 @@
 
     // Step 3: Account Picker tile (#tilesHolder).
     const tilesHolder = document.querySelector("#tilesHolder");
-    if (tilesHolder && isVisible(tilesHolder) && !readRecentGuard(TILE_GUARD_KEY)) {
+    if (
+      tilesHolder &&
+      isVisible(tilesHolder) &&
+      !readRecentGuard(TILE_GUARD_KEY)
+    ) {
       const tiles = Array.from(
         tilesHolder.querySelectorAll(
           "[data-test-id], .table[role='button'], .tile-container .table",
@@ -511,9 +527,7 @@
       let targetTile = null;
       if (configuredUser) {
         targetTile = tiles.find((el) =>
-          String(
-            el.getAttribute("data-test-id") || el.textContent || "",
-          )
+          String(el.getAttribute("data-test-id") || el.textContent || "")
             .toLowerCase()
             .includes(configuredUser),
         );
@@ -541,7 +555,9 @@
       isVisible(submitBtn) &&
       !readRecentGuard(USER_GUARD_KEY)
     ) {
-      const existingVal = String(userInput.value || "").trim().toLowerCase();
+      const existingVal = String(userInput.value || "")
+        .trim()
+        .toLowerCase();
       if (configuredUser && existingVal && existingVal !== configuredUser) {
         return;
       }

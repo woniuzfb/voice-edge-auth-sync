@@ -409,4 +409,6 @@ main {
   color: var(--muted);
 }
 
-.ve-badge-sharepoint { background: #038387; }
+.ve-badge-sharepoint {
+  background: #038387;
+}

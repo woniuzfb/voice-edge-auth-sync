@@ -8,22 +8,24 @@
 
 `voice-edge-auth-sync` 是配合本地 Voice Edge 服务的跨浏览器扩展（Firefox MV2 / Chromium MV3），单一源码树构建两端。模块职责（只到"这块负责什么"，不写实现方式）：
 
-| 文件 | 职责 |
-| --- | --- |
-| `src/background.js` | 后台核心：Native Messaging、各站点凭证采集与调度、M365 会话桥与令牌获取、SharePoint 预续期调度 |
-| `src/browser-polyfill.js` | `browser.*` Promise 化兼容垫片（Firefox 无操作 / Chromium 包装） |
-| `src/content-doubao.js` | 豆包页面侧的 SSE 捕获与转发（仅 Chromium 需要） |
-| `src/content-deepseek.js` | DeepSeek 会话与模型模式快照 |
-| `src/content-m365.js` | M365 页面主世界钩子：会话、保活、令牌事件、页面侧请求改写 |
-| `src/content-m365-login.js` | Entra ID 登录页的受控自动填密与失败识别 |
-| `src/content-sharepoint.js` | SharePoint 上传、回读校验、Cookie/Digest/Token 预续期 |
-| `src/popup.*` | 面板视图、状态渲染、设置项 |
-| `src/icons/` | 图标资源 |
+| 文件                        | 职责                                                                                           |
+| --------------------------- | ---------------------------------------------------------------------------------------------- |
+| `src/background.js`         | 后台核心：Native Messaging、各站点凭证采集与调度、M365 会话桥与令牌获取、SharePoint 预续期调度 |
+| `src/browser-polyfill.js`   | `browser.*` Promise 化兼容垫片（Firefox 无操作 / Chromium 包装）                               |
+| `src/content-doubao.js`     | 豆包页面侧的 SSE 捕获与转发（仅 Chromium 需要）                                                |
+| `src/content-deepseek.js`   | DeepSeek 会话与模型模式快照                                                                    |
+| `src/content-m365.js`       | M365 页面主世界钩子：会话、保活、令牌事件、页面侧请求改写                                      |
+| `src/content-m365-login.js` | Entra ID 登录页的受控自动填密与失败识别                                                        |
+| `src/content-sharepoint.js` | SharePoint 上传、回读校验、Cookie/Digest/Token 预续期                                          |
+| `src/popup.*`               | 面板视图、状态渲染、设置项                                                                     |
+| `src/icons/`                | 图标资源                                                                                       |
 
 ## 2. 目录与构建
 
 ```text
-build.mjs              # 零依赖构建脚本：合并 manifest，按引用复制 src → dist/<target>/
+build.mjs              # 构建脚本：自动运行 Prettier、合并 manifest，按引用复制 src → dist/<target>/
+.prettierrc.json       # Prettier 格式配置
+.prettierignore        # Prettier 忽略列表
 manifest.base.json     # 两端共享字段
 manifest.firefox.json  # Firefox MV2 覆盖字段
 manifest.chrome.json   # Chromium MV3 覆盖字段
@@ -36,8 +38,10 @@ dist/                  # 构建产物（已 gitignore）
 ```
 
 ```bash
-npm run build          # 两端都构建（等价 node build.mjs all）
+npm run build          # 自动 Prettier 格式化并构建两端（等价 node build.mjs all）
 npm run build:chrome   # 只构建 chrome（harness 校验的是 dist/chrome）
+npm run format         # 全仓 Prettier 格式化（prettier --write .）
+npm run format:check   # 全仓 Prettier 格式检查（prettier --check .）
 npm run test:reauth    # 离线 harness
 ```
 
@@ -73,10 +77,10 @@ npm run test:reauth    # 离线 harness
 
 ## 7. 文档分工
 
-| 文件 | 写什么 | 不写什么 |
-| --- | --- | --- |
-| `AGENTS.md`（本文件） | 规范、目录、构建/验证流程、禁令 | 实现细节 |
-| `.memory/MEMORY.md` | **当前实现的事实**：不变量、协议参数、常量及其依据、已知坑、明确否决过的做法 | 过程流水账 |
-| `.memory/YYYY-MM-DD.md` | 当天做了什么、证据（日志/实测数字）、结论 | 已被推翻的旧结论（直接改掉，不要堆叠） |
+| 文件                    | 写什么                                                                       | 不写什么                               |
+| ----------------------- | ---------------------------------------------------------------------------- | -------------------------------------- |
+| `AGENTS.md`（本文件）   | 规范、目录、构建/验证流程、禁令                                              | 实现细节                               |
+| `.memory/MEMORY.md`     | **当前实现的事实**：不变量、协议参数、常量及其依据、已知坑、明确否决过的做法 | 过程流水账                             |
+| `.memory/YYYY-MM-DD.md` | 当天做了什么、证据（日志/实测数字）、结论                                    | 已被推翻的旧结论（直接改掉，不要堆叠） |
 
 写文档时保持"一份事实只有一个出处"：同一个机制不要在两处各写一遍，否则迟早互相矛盾。
