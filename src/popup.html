@@ -34,7 +34,9 @@
       <!-- DeepSeek -->
       <article class="ve-card" data-provider="deepseek">
         <div class="ve-card-head">
-          <span class="ve-badge ve-badge-deepseek">DeepSeek</span>
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-deepseek">DeepSeek</span>
+          </span>
           <span class="ve-status" id="ds-status">—</span>
           <button class="ve-mini-btn ve-open" data-open="deepseek">打开</button>
         </div>
@@ -91,7 +93,9 @@
       <!-- Qwen -->
       <article class="ve-card" data-provider="qwen">
         <div class="ve-card-head">
-          <span class="ve-badge ve-badge-qwen">Qwen</span>
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-qwen">Qwen</span>
+          </span>
           <span class="ve-status" id="qw-status">—</span>
           <button class="ve-mini-btn ve-open" data-open="qwen">打开</button>
         </div>
@@ -132,7 +136,9 @@
       <!-- Doubao -->
       <article class="ve-card" data-provider="doubao">
         <div class="ve-card-head">
-          <span class="ve-badge ve-badge-doubao">豆包</span>
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-doubao">豆包</span>
+          </span>
           <span class="ve-status" id="db-status">—</span>
           <button class="ve-mini-btn ve-open" data-open="doubao">打开</button>
         </div>
@@ -184,7 +190,9 @@
       <!-- SharePoint Online -->
       <article class="ve-card" data-provider="sharepoint">
         <div class="ve-card-head">
-          <span class="ve-badge ve-badge-sharepoint">SharePoint</span>
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-sharepoint">SharePoint</span>
+          </span>
           <span class="ve-status" id="sp-status">—</span>
         </div>
         <dl class="ve-kv">
@@ -213,7 +221,9 @@
       <!-- M365 Copilot -->
       <article class="ve-card" data-provider="m365">
         <div class="ve-card-head">
-          <span class="ve-badge ve-badge-m365">M365 Copilot</span>
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-m365">M365 Copilot</span>
+          </span>
           <span class="ve-status" id="m365-status">—</span>
           <button class="ve-mini-btn ve-open" data-open="m365">打开</button>
         </div>
@@ -234,7 +244,55 @@
             <dt>刷新错误</dt>
             <dd id="m365-refresh-error">—</dd>
           </div>
+          <div id="m365-autologin-row">
+            <dt>自动重登</dt>
+            <dd id="m365-autologin-status">—</dd>
+          </div>
         </dl>
+        <div class="ve-autologin-panel" id="m365-autologin-box">
+          <div class="ve-autologin-toggles">
+            <label class="ve-check">
+              <input type="checkbox" id="m365-autologin-enabled" checked />
+              <span>启用 24h 自动重登</span>
+            </label>
+            <label
+              class="ve-check"
+              title="勾选后，在当前绑定租户的登录页手动输入密码成功登录一次即可自动保存"
+            >
+              <input type="checkbox" id="m365-autologin-remember" />
+              <span>记住网页登录密码</span>
+            </label>
+          </div>
+          <div class="ve-inline-form">
+            <input
+              type="password"
+              id="m365-autologin-pass"
+              class="ve-input"
+              placeholder="输入 M365 密码"
+              autocomplete="off"
+            />
+            <div class="ve-inline-actions">
+              <button
+                id="m365-autologin-clear"
+                class="ve-mini-btn"
+                title="清除已保存的自动重登密码"
+                hidden
+              >
+                清除
+              </button>
+              <button
+                id="m365-autologin-save"
+                class="ve-mini-btn"
+                title="保存自动重登密码并解除暂停"
+              >
+                保存
+              </button>
+            </div>
+          </div>
+          <p class="ve-sub-note">
+            注：密码以明文保存于本机扩展存储，仅用于当前绑定租户自动续签。
+          </p>
+        </div>
         <div class="ve-persist">
           <div class="ve-persist-head">
             <span class="ve-persist-title">持久化会话 (Voice Edge)</span>
@@ -269,6 +327,28 @@
                 新建
               </button>
             </div>
+            <div id="m365-gpt61-row" hidden>
+              <dt>GPT 6.1</dt>
+              <dd id="m365-gpt61">—</dd>
+              <button
+                class="ve-mini-btn ve-new"
+                data-new="m365"
+                data-model="LLM:m365-chatgpt-61"
+              >
+                新建
+              </button>
+            </div>
+            <div id="m365-gpt6-chat-row" hidden>
+              <dt>GPT 6 quick</dt>
+              <dd id="m365-gpt6-chat">—</dd>
+              <button
+                class="ve-mini-btn ve-new"
+                data-new="m365"
+                data-model="LLM:m365-chatgpt-6-chat"
+              >
+                新建
+              </button>
+            </div>
             <div id="m365-gpt56-row" hidden>
               <dt>GPT 5.6</dt>
               <dd id="m365-gpt56">—</dd>
@@ -280,13 +360,13 @@
                 新建
               </button>
             </div>
-            <div id="m365-gpt55-row" hidden>
-              <dt>GPT 5.5</dt>
-              <dd id="m365-gpt55">—</dd>
+            <div id="m365-gpt56-chat-row" hidden>
+              <dt>GPT 5.6 quick</dt>
+              <dd id="m365-gpt56-chat">—</dd>
               <button
                 class="ve-mini-btn ve-new"
                 data-new="m365"
-                data-model="LLM:m365-chatgpt-5.5"
+                data-model="LLM:m365-chatgpt-5.6-chat"
               >
                 新建
               </button>

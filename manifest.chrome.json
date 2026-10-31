@@ -57,6 +57,12 @@
       "js": ["browser-polyfill.js", "content-sharepoint.js"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": ["https://login.microsoftonline.com/*"],
+      "js": ["browser-polyfill.js", "content-m365-login.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "action": {

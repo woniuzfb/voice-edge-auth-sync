@@ -7,6 +7,7 @@
  *   node build.mjs firefox         # build one target
  *   node build.mjs chrome --zip    # build + zip
  *   node build.mjs all --zip       # build both + zip each
+ *   node build.mjs --no-clean      # keep dist/ contents, only overwrite
  *
  * Layout:
  *   src/                     shared source (background.js is platform-neutral)
@@ -101,7 +102,12 @@ function build(target) {
   }
   const manifest = mergeManifest(target);
   const outDir = join(DIST, target);
-  rmSync(outDir, { recursive: true, force: true });
+  // `--no-clean` keeps the output directory and only overwrites files: sandboxes
+  // and permission prompts often block recursive deletes, and a dev build does
+  // not need a pristine tree.
+  if (!process.argv.includes("--no-clean")) {
+    rmSync(outDir, { recursive: true, force: true });
+  }
   mkdirSync(outDir, { recursive: true });
 
   const files = referencedFiles(manifest);

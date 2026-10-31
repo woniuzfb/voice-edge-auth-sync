@@ -36,8 +36,20 @@
     };
     const frameMayHostSocket = () =>
       M365_SHELL_ORIGINS[location.origin] !== true;
+    // 钩子版本：老页面里已经有旧钩子时，只要版本更旧就重新装一层，这样
+    // "重载扩展" 之后不必再刷新 OWA 页面（旧钩子会把 version 留成 undefined=1）。
+    const PAGE_HOOK_VERSION = 2;
     const priorHook = window.__veM365Hook;
-    if (priorHook && priorHook.ready === true) {
+    if (
+      priorHook &&
+      priorHook.ready === true &&
+      Number(priorHook.version || 1) >= PAGE_HOOK_VERSION
+    ) {
+      try {
+        if (document.documentElement) {
+          document.documentElement.setAttribute("data-ve-m365-hook", "ready");
+        }
+      } catch (_) {}
       if (frameMayHostSocket()) {
         window.postMessage(
           {
@@ -56,6 +68,7 @@
     // Do not advertise readiness until every handler below has been installed.
     const hookState = {
       ready: false,
+      version: PAGE_HOOK_VERSION,
       capabilities: null,
     };
     window.__veM365Hook = hookState;
@@ -211,10 +224,75 @@
     // ---- 捕获页面 token fetch 的成功响应，保存服务端轮换后的 refresh_token ----
     (function hookTokenFetch() {
       const originalFetch = window.fetch;
-      if (originalFetch.__veM365TokenHook) return;
+      if (typeof originalFetch !== "function") return;
+      // 只跳过"同版本或更新"的包装器。旧扩展留下的包装器没有版本号（=1），
+      // 新钩子必须再叠一层，否则新闭包里的 _veM365Rt 永远用不上（实机踩到：
+      // 页面探针走了旧 wrapper，替换次数 0，AAD 回 AADSTS70000）。
+      if (
+        originalFetch.__veM365TokenHook &&
+        Number(originalFetch.__veM365TokenHookVersion || 1) >= PAGE_HOOK_VERSION
+      )
+        return;
 
       async function wrappedFetch(input, init) {
-        const response = await originalFetch.apply(this, arguments);
+        // Order RT generations by request start, never by response arrival: the
+        // page fires one /token per resource and they can finish out of order.
+        const requestStartedAt = Date.now();
+        // Swap the page's refresh_token for the extension's freshest one BEFORE
+        // the request leaves the page. This is the piece webRequest cannot do
+        // (Firefox cannot rewrite a POST body), and it is why a renewed RT is
+        // actually used by OWA without reloading anything.
+        let callArgs = arguments;
+        let swappedNow = false;
+        try {
+          const href =
+            typeof input === "string" ? input : (input && input.url) || "";
+          if (TOKEN_ENDPOINT_RE.test(href)) {
+            if (
+              typeof input === "string" &&
+              init &&
+              typeof init.body !== "undefined"
+            ) {
+              const text =
+                typeof init.body === "string"
+                  ? init.body
+                  : typeof URLSearchParams !== "undefined" &&
+                      init.body instanceof URLSearchParams
+                    ? init.body.toString()
+                    : "";
+              const swapped = swapRefreshToken(text);
+              if (swapped) {
+                init = Object.assign({}, init, { body: swapped });
+                callArgs = [input, init];
+                swappedNow = true;
+                _veM365SwapCount += 1;
+                post({ type: "M365_RT_SWAPPED", at: Date.now() });
+              }
+            } else if (
+              typeof Request !== "undefined" &&
+              input instanceof Request
+            ) {
+              const clone = input.clone();
+              const swapped = swapRefreshToken(await clone.text());
+              if (swapped) {
+                callArgs = [new Request(input, { body: swapped })];
+                swappedNow = true;
+                _veM365SwapCount += 1;
+                post({ type: "M365_RT_SWAPPED", at: Date.now() });
+              }
+            }
+          }
+        } catch (_) {}
+        const response = await originalFetch.apply(this, callArgs);
+        if (swappedNow && response && response.status >= 400) {
+          // 我们这条被 AAD 拒了：不回退到页面的旧 RT（旧 RT 一律不用）。
+          // 上报给后台，由后台用真实刷新验证；真的死了就立刻走顶层授权换新的。
+          post({
+            type: "M365_RT_SWAP_FAILED",
+            status: Number(response.status || 0),
+            at: Date.now(),
+          });
+        }
         // Passively reuse the page's own AMS auth/bytes (see _amsBytes /
         // _amsPageAuth above). Never blocks or alters the page's response.
         try {
@@ -254,8 +332,37 @@
             typeof input === "string" ? input : (input && input.url) || "",
             location.href,
           );
+          if (
+            /\/abt\/userstate\b/i.test(requestUrl.href) &&
+            /[?&]action=SHOULD_(?:PROMPT|SIGNOUT)\b/i.test(requestUrl.href)
+          ) {
+            try {
+              const data = await response.clone().json();
+              if (
+                data &&
+                (data.result === true || data.respectResult === true)
+              ) {
+                const patched = JSON.stringify(
+                  Object.assign({}, data, {
+                    result: false,
+                    respectResult: false,
+                    timeSinceActivity: 0,
+                  }),
+                );
+                return new Response(patched, {
+                  status: response.status || 200,
+                  statusText: response.statusText || "OK",
+                  headers: { "Content-Type": "application/json" },
+                });
+              }
+            } catch (_) {
+            } finally {
+              setTimeout(() => touchM365AbtActivity(true), 0);
+            }
+            return response;
+          }
           const match = requestUrl.href.match(
-            /^https:\/\/login\.microsoftonline\.com\/([0-9a-f-]{36})\/oauth2\/v2\.0\/token/i,
+            /^https:\/\/login\.microsoftonline\.com\/([0-9a-f-]{36}|organizations|common)\/oauth2\/v2\.0\/token/i,
           );
           if (!match) return response;
 
@@ -267,12 +374,13 @@
             } catch (_) {}
           }
           const params = new URLSearchParams(bodyText);
+          const grantType = String(params.get("grant_type") || "");
           const scopes = String(params.get("scope") || "")
             .split(/\s+/)
             .filter(Boolean);
           if (
-            params.get("grant_type") !== "refresh_token" ||
-            !scopes.includes("https://substrate.office.com/sydney/.default")
+            grantType !== "refresh_token" &&
+            grantType !== "authorization_code"
           )
             return response;
 
@@ -285,25 +393,422 @@
           const payload = await response.clone().json();
           if (!payload || !payload.access_token || !payload.refresh_token)
             return response;
+          const claims = jwtClaims(payload.access_token);
+          const aud = String(claims.aud || "").replace(/\/$/, "");
+          const isSydney =
+            scopes.includes("https://substrate.office.com/sydney/.default") ||
+            aud === "https://substrate.office.com/sydney";
+          const isBoundClient =
+            Boolean(_veM365RtClientId) && clientId === _veM365RtClientId;
+          // Accept Sydney responses and same-clientId sibling rotations (once
+          // background has pushed _veM365RtClientId via KEEPALIVE/probe) so
+          // Chrome MV3 keeps _rt and _rtExp fresh alongside Firefox.
+          if (!isSydney && !isBoundClient) return response;
           post({
             type: "M365_TOKEN_RESPONSE",
-            tenantId: match[1],
+            tenantId: String(claims.tid || match[1] || ""),
             clientId,
+            isSydneyScope: isSydney,
+            grantType,
             accessToken: String(payload.access_token),
             refreshToken: String(payload.refresh_token),
             expiresIn: Number(payload.expires_in || 0),
+            refreshTokenExpiresIn: Number(
+              payload.refresh_token_expires_in || 0,
+            ),
+            requestStartedAt,
             capturedAt: Date.now(),
           });
         } catch (_) {}
         return response;
       }
       Object.defineProperty(wrappedFetch, "__veM365TokenHook", { value: true });
+      Object.defineProperty(wrappedFetch, "__veM365TokenHookVersion", {
+        value: PAGE_HOOK_VERSION,
+      });
       try {
         Object.defineProperty(wrappedFetch, "name", {
           value: originalFetch.name,
         });
       } catch (_) {}
       window.fetch = wrappedFetch;
+    })();
+
+    // ---- 限制 MSAL 在 24h RT 过期后每 ~60s 重复弹出交互式登录小窗口 ----------
+    // 后台最新的一条 24h SPA RT（连同它的 client_id）。页面自己的 MSAL 有一份私有
+    // 副本，光靠 webRequest 是改不了它的；但我们可以在这个页面世界的 fetch 钩子里
+    // 把 /token 请求的 refresh_token 换成这一条（见 swapRefreshToken），于是页面
+    // 下一次刷新就自动用上新 RT，不需要重载页面。
+    let _veM365Rt = "";
+    let _veM365RtClientId = "";
+    let _veM365RtAt = 0;
+    const TOKEN_ENDPOINT_RE =
+      /^https:\/\/login\.microsoftonline\.com\/[^/]+\/oauth2\/v2\.0\/token\b/i;
+
+    // 把表单体里的 refresh_token 换成后台那条。只动这一个字段，任何不匹配
+    // （不是 refresh_token 授权、client 不同、没有新 RT）都原样返回 null，让页面
+    // 继续用自己的请求，绝不因为这里出错而影响页面登录。
+    function swapRefreshToken(bodyText) {
+      try {
+        if (!_veM365Rt || !_veM365RtClientId) return null;
+        if (!bodyText || bodyText.indexOf("grant_type=refresh_token") < 0)
+          return null;
+        const params = new URLSearchParams(bodyText);
+        if (params.get("grant_type") !== "refresh_token") return null;
+        if (String(params.get("client_id") || "") !== _veM365RtClientId)
+          return null;
+        const current = String(params.get("refresh_token") || "");
+        if (!current || current === _veM365Rt) return null;
+        params.set("refresh_token", _veM365Rt);
+        return params.toString();
+      } catch (_) {
+        return null;
+      }
+    }
+
+    // 探针：由后台（且只有后台，经 bridge 命令）触发，在页面里用一条假旧 RT 发
+    // 一次 /token —— 若是改写生效，AAD 会用我们那条真 RT 换到新令牌，返回 200。
+    // 只回报状态码与是否含 access_token，绝不回报任何令牌内容。
+    async function probePageToken(d) {
+      // 页面上可能叠着好几个版本的钩子（扩展更新但页面没刷新）。只有"当前"
+      // 那个钩子有权回答探针，否则最先装上的旧钩子会用空 RT 回一个 400，
+      // 把结果盖掉（实机现象：swapped=0，但外层其实已经换过）。
+      if (window.__veM365Hook !== hookState) return;
+      // 自包含：探针自己带上 RT，不依赖此前是否收到过 KEEPALIVE
+      if (d && typeof d.rt === "string" && d.rt) {
+        _veM365Rt = d.rt;
+        _veM365RtClientId = String(d.rtClientId || _veM365RtClientId || "");
+      }
+      const tid = String((d && d.tid) || "");
+      const clientId = String(
+        (d && d.clientId) || _veM365RtClientId || "",
+      );
+      if (!tid || !clientId || !_veM365Rt) {
+        post({
+          type: "M365_PAGE_TOKEN_PROBE_RESULT",
+          ok: false,
+          error: "missing tid/clientId/rt",
+        });
+        return;
+      }
+      let status = 0;
+      let hasToken = false;
+      let error = "";
+      let swapped = 0;
+      try {
+        const before = _veM365SwapCount;
+        // 照抄页面真实请求体（redirect_uri / brk_client_id / brk_redirect_uri /
+        // claims …），只把 refresh_token 换成一条明显的假值，等钩子把它改成真 RT。
+        const params = new URLSearchParams();
+        const template = (d && d.template) || {};
+        for (const key of Object.keys(template)) {
+          const value = template[key];
+          if (value != null && value !== "") params.set(key, String(value));
+        }
+        params.set("client_id", clientId);
+        params.set("grant_type", "refresh_token");
+        params.set("refresh_token", "PROBE-PAGE-OLD-RT");
+        // scope 不在探针里兜底：模板就是页面自己的请求体，后台已确认它带 scope
+        const res = await window.fetch(
+          "https://login.microsoftonline.com/" +
+            encodeURIComponent(tid) +
+            "/oauth2/v2.0/token?ve_probe=1",
+          {
+            method: "POST",
+            headers: {
+              Accept: "*/*",
+              "Content-Type":
+                "application/x-www-form-urlencoded;charset=utf-8",
+            },
+            body: params.toString(),
+          },
+        );
+        status = Number(res.status || 0);
+        swapped = _veM365SwapCount - before;
+        if (res.ok) {
+          try {
+            const payload = await res.clone().json();
+            hasToken = Boolean(payload && payload.access_token);
+          } catch (_) {}
+        } else {
+          try {
+            error = String(await res.clone().text()).slice(0, 180);
+          } catch (_) {}
+        }
+      } catch (e) {
+        error = String((e && e.message) || e);
+      }
+      post({
+        type: "M365_PAGE_TOKEN_PROBE_RESULT",
+        at: Date.now(),
+        status,
+        ok: Boolean(status >= 200 && status < 300 && hasToken),
+        hasToken,
+        swapped,
+        error,
+      });
+    }
+
+    let _veM365SwapCount = 0;
+    let _veM365AuthHealthy = false;
+    // Authorize popups opened by OWA/MSAL itself are suppressed by DEFAULT: they
+    // re-run the same silent attempt that already failed (AAD answers
+    // interaction_required), and MSAL retries them every ~60s — the visible
+    // symptom was "a login window pops up every minute". The background can only
+    // narrow this (never widen it), and a real user gesture still gets through
+    // so manual sign-in inside OWA keeps working.
+    let _veM365SuppressPopups = true;
+    const AUTH_POPUP_SHARED_KEY = "__veM365AuthPopupAt";
+    function readSharedPopupAt() {
+      try {
+        return Number(window.localStorage.getItem(AUTH_POPUP_SHARED_KEY) || 0);
+      } catch (_) {
+        return 0;
+      }
+    }
+    function writeSharedPopupAt(at) {
+      try {
+        window.localStorage.setItem(AUTH_POPUP_SHARED_KEY, String(at));
+      } catch (_) {}
+    }
+    (function hookAuthPopupOpen() {
+      if (typeof window.open !== "function" || window.open.__veM365PopupHook)
+        return;
+      const origOpen = window.open;
+      const AUTH_POPUP_COOLDOWN_MS = 30 * 60 * 1000;
+      let _lastAuthPopupAt = 0;
+      let _lastAuthPopupWin = null;
+      function wrappedOpen(url, target, features) {
+        try {
+          const href = String(url || "");
+          if (
+            /login\.microsoftonline\.com\/.*\/oauth2\/v2\.0\/authorize/i.test(
+              href,
+            )
+          ) {
+            const now = Date.now();
+            // A real user gesture (click on "sign in") must always win, so manual
+            // sign-in inside OWA is never blocked by the extension.
+            let userInitiated = false;
+            try {
+              userInitiated = Boolean(
+                window.navigator &&
+                  window.navigator.userActivation &&
+                  window.navigator.userActivation.isActive,
+              );
+            } catch (_) {}
+            if (!userInitiated) {
+              if (_veM365AuthHealthy) {
+                post({
+                  type: "M365_POPUP_INTERCEPTED",
+                  action: "suppressed-healthy",
+                  url: href,
+                });
+                return null;
+              }
+              if (_veM365SuppressPopups) {
+                post({
+                  type: "M365_POPUP_INTERCEPTED",
+                  action: "suppressed-reauth",
+                  url: href,
+                });
+                return null;
+              }
+            }
+            if (_lastAuthPopupWin && !_lastAuthPopupWin.closed) {
+              try {
+                _lastAuthPopupWin.focus();
+              } catch (_) {}
+              post({
+                type: "M365_POPUP_INTERCEPTED",
+                action: "reused-open-popup",
+                url: href,
+              });
+              return _lastAuthPopupWin;
+            }
+            // The throttle has to be shared by every frame of this origin: this
+            // hook runs per frame (all_frames: true) and OWA keeps recreating
+            // iframes, so per-frame state re-armed itself and produced a new
+            // login window every few minutes.
+            const sharedAt = readSharedPopupAt();
+            const lastAt = Math.max(_lastAuthPopupAt, sharedAt);
+            if (now - lastAt < AUTH_POPUP_COOLDOWN_MS) {
+              post({
+                type: "M365_POPUP_INTERCEPTED",
+                action: "throttled-30m",
+                url: href,
+                sinceLastMs: now - lastAt,
+              });
+              return null;
+            }
+            _lastAuthPopupAt = now;
+            writeSharedPopupAt(now);
+            post({
+              type: "M365_POPUP_INTERCEPTED",
+              action: "opened",
+              url: href,
+            });
+            _lastAuthPopupWin = origOpen.apply(this, arguments);
+            return _lastAuthPopupWin;
+          }
+        } catch (_) {}
+        return origOpen.apply(this, arguments);
+      }
+      try {
+        Object.defineProperty(wrappedOpen, "__veM365PopupHook", { value: true });
+      } catch (_) {}
+      window.open = wrappedOpen;
+    })();
+
+    // ---- ABT (Activity-Based Timeout) 预续期与弹窗防卫 ----------------------
+    // outlook.office.com / outlook.cloud.microsoft 宿主页面初始化 Shared ABT
+    // （3pidentity.svc.cloud.microsoft/abt/userstate，默认 timeout=540 分钟）。
+    // 由于插件在子 frame 自建 Chathub WSS 通信，宿主页面若长时间无真实鼠标/
+    // 键盘事件，会在到期前 10 分钟请求 action=SHOULD_PROMPT 弹出「是否希望保持
+    // 登录状态?」（#abtPrompt），到期后请求 action=SHOULD_SIGNOUT 并跳转
+    // login.microsoftonline.com/common/oauth2/v2.0/logout 导致整站登录失效。
+    //
+    // 这里通过三层机制在过期前自动续期，并内置断网/请求失败指数退避重试：
+    //   1) 周期性主动调用 window.AbtInteraction.AbtRegisterActivity(true)（与点击
+    //      「保持登录状态」按钮完全同源：更新 localStorage.AbtActivity、立即向
+    //      3pidentity.svc.cloud.microsoft/abt/userstate POST SIGNIN 刷新服务端
+    //      ABT-<puid> Cookie、重置 PromptUtils 计时器），并派发轻量 mousedown 事件
+    //      兼容闭包内的 O365Shell.Abt；
+    //   2) 在 XHR / fetch 阶段拦截 /abt/userstate?action=SHOULD_PROMPT|SHOULD_SIGNOUT
+    //      （同时兼容 responseType=""/"text" 与 "json"）：若休眠唤醒后定时器抢先
+    //      触发且服务端返回 result:true，在读取前将其重写为 result:false,
+    //      respectResult:false, timeSinceActivity:0，并在 finally 中确保触发
+    //      AbtRegisterActivity(true) 刷新服务端状态；
+    //   3) 监听 /abt/userstate 网络失败与离线状态，自动按指数退避（15s~120s）或
+    //      网络恢复（online 事件）重新续期。
+    // PAGE_HOOK 通过 toString() 序列化注入页面世界，在此定义同值基准常量（15m）并引用
+    const PAGE_KEEPALIVE_BASE_MS = 15 * 60 * 1000;
+    const M365_ABT_KEEPALIVE_INTERVAL_MS = PAGE_KEEPALIVE_BASE_MS;
+    let _lastAbtTouchAt = 0;
+    let _abtRetryTimer = null;
+    let _abtRetryAttempt = 0;
+
+    function scheduleAbtRetry(reason) {
+      if (_abtRetryTimer) return;
+      if (_abtRetryAttempt >= 6) return;
+      const baseDelay = Math.min(120000, 15000 * 2 ** _abtRetryAttempt);
+      const delay = Math.round(baseDelay * (0.85 + Math.random() * 0.3));
+      _abtRetryAttempt += 1;
+      _abtRetryTimer = setTimeout(() => {
+        _abtRetryTimer = null;
+        touchM365AbtActivity(true);
+      }, delay);
+      dbg("scheduled ABT retry #%d in %dms (%s)", _abtRetryAttempt, delay, reason || "");
+    }
+
+    function clearAbtRetry() {
+      _abtRetryAttempt = 0;
+      if (_abtRetryTimer) {
+        clearTimeout(_abtRetryTimer);
+        _abtRetryTimer = null;
+      }
+    }
+
+    function touchM365AbtActivity(forceServer = true) {
+      const now = Date.now();
+      const isOffline =
+        typeof navigator !== "undefined" && navigator.onLine === false;
+      if (!forceServer && !isOffline && now - _lastAbtTouchAt < 30000)
+        return false;
+      let invokedAbt = false;
+      try {
+        if (window.AbtUI && typeof window.AbtUI.AbtHidePrompt === "function") {
+          window.AbtUI.AbtHidePrompt();
+        }
+      } catch (_) {}
+      try {
+        const promptRoot =
+          document.getElementById("abtPrompt") ||
+          document.querySelector("#abtPrompt");
+        if (promptRoot) {
+          const primaryBtn = promptRoot.querySelector(
+            "button.ms-Button--primary, button[class*='PrimaryButton']",
+          );
+          if (primaryBtn && typeof primaryBtn.click === "function") {
+            primaryBtn.click();
+          }
+        }
+      } catch (_) {}
+      try {
+        window.dispatchEvent(
+          new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+        );
+      } catch (_) {}
+      if (isOffline) {
+        _lastAbtTouchAt = 0;
+        scheduleAbtRetry("offline");
+        try {
+          post({
+            type: "M365_SESSION_RENEW_FAILED",
+            at: now,
+            frameOrigin: location.origin,
+            error: "offline",
+          });
+        } catch (_) {}
+        return false;
+      }
+      _lastAbtTouchAt = now;
+      try {
+        if (
+          window.AbtInteraction &&
+          typeof window.AbtInteraction.AbtRegisterActivity === "function"
+        ) {
+          window.AbtInteraction.AbtRegisterActivity(Boolean(forceServer));
+          invokedAbt = true;
+        }
+      } catch (_) {}
+      if (invokedAbt || window === window.top) {
+        try {
+          post({
+            type: "M365_SESSION_RENEWED",
+            at: now,
+            frameOrigin: location.origin,
+            invokedAbt,
+          });
+        } catch (_) {}
+      }
+      return invokedAbt;
+    }
+
+    (function setupAbtKeepAlive() {
+      // 监听 ABT 内部广播的 abtPromptShown 事件，一旦出现立即续期并关闭弹窗
+      window.addEventListener(
+        "message",
+        (ev) => {
+          try {
+            if (!ev || typeof ev.data !== "string" || !ev.data) return;
+            if (
+              ev.data.includes("abtPromptShown") ||
+              ev.data.includes("abtSignOutEventForHost")
+            ) {
+              const parsed = JSON.parse(ev.data);
+              if (parsed && parsed.eventId === "abtPromptShown") {
+                touchM365AbtActivity(true);
+              }
+            }
+          } catch (_) {}
+        },
+        true,
+      );
+      setTimeout(() => touchM365AbtActivity(true), 30000);
+      setInterval(
+        () => touchM365AbtActivity(true),
+        M365_ABT_KEEPALIVE_INTERVAL_MS,
+      );
+      window.addEventListener("focus", () => touchM365AbtActivity(false));
+      window.addEventListener("online", () => {
+        clearAbtRetry();
+        touchM365AbtActivity(true);
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible")
+          touchM365AbtActivity(false);
+      });
     })();
 
     // ---- 被动截获页面【自己发】的 GetChats(XHR),缓存;不主动 fetch、不碰 token ----
@@ -314,7 +819,87 @@
       const SRH = XMLHttpRequest.prototype.setRequestHeader;
       XMLHttpRequest.prototype.open = function (method, url) {
         try {
-          this.__veUrl = String(url || "");
+          const u = String(url || "");
+          this.__veUrl = u;
+          this.__veMethod = String(method || "GET").toUpperCase();
+          if (/\/abt\/userstate\b/i.test(u)) {
+            const isPromptOrSignout = /[?&]action=SHOULD_(?:PROMPT|SIGNOUT)\b/i.test(u);
+            if (isPromptOrSignout) {
+              // 在 open 阶段率先注册 load 监听器（早于调用方设置 xhr.onload），
+              // 兼容 responseType 为 ""/"text" 或 "json"，并在 finally 中确保触发续期。
+              this.addEventListener("load", function () {
+                try {
+                  const rType = String(this.responseType || "");
+                  let data = null;
+                  if (rType === "" || rType === "text") {
+                    const raw = String(this.responseText || "");
+                    if (raw) data = JSON.parse(raw);
+                  } else if (rType === "json") {
+                    data = this.response;
+                  }
+                  if (
+                    data &&
+                    typeof data === "object" &&
+                    (data.result === true || data.respectResult === true)
+                  ) {
+                    const patchedObj = Object.assign({}, data, {
+                      result: false,
+                      respectResult: false,
+                      timeSinceActivity: 0,
+                    });
+                    const patchedStr = JSON.stringify(patchedObj);
+                    try {
+                      if (rType === "" || rType === "text") {
+                        Object.defineProperty(this, "responseText", {
+                          configurable: true,
+                          get: () => patchedStr,
+                        });
+                      }
+                      Object.defineProperty(this, "response", {
+                        configurable: true,
+                        get: () => (rType === "json" ? patchedObj : patchedStr),
+                      });
+                    } catch (_) {}
+                  }
+                } catch (_) {
+                } finally {
+                  setTimeout(() => touchM365AbtActivity(true), 0);
+                }
+              });
+            } else {
+              // 监控 ABT SIGNIN 等保活请求的成功/失败状态，遇到断网或 5xx/429 时触发退避重试
+              const onAbtNetworkFail = (reason) => {
+                _lastAbtTouchAt = 0;
+                scheduleAbtRetry(reason);
+                try {
+                  post({
+                    type: "M365_SESSION_RENEW_FAILED",
+                    at: Date.now(),
+                    frameOrigin: location.origin,
+                    error: String(reason || "abt-xhr-error"),
+                  });
+                } catch (_) {}
+              };
+              this.addEventListener("error", () => onAbtNetworkFail("xhr-error"));
+              this.addEventListener("timeout", () => onAbtNetworkFail("xhr-timeout"));
+              this.addEventListener("load", function () {
+                const st = Number(this.status || 0);
+                if (st >= 200 && st < 300) {
+                  clearAbtRetry();
+                  try {
+                    post({
+                      type: "M365_SESSION_RENEWED",
+                      at: Date.now(),
+                      frameOrigin: location.origin,
+                      invokedAbt: true,
+                    });
+                  } catch (_) {}
+                } else if (st === 0 || st === 429 || st >= 500) {
+                  onAbtNetworkFail("xhr-status-" + st);
+                }
+              });
+            }
+          }
         } catch (_) {}
         return O.apply(this, arguments);
       };
@@ -466,9 +1051,14 @@
       const d = ev.data;
       if (!d || d.__veM365 !== true || d.dir !== "toPage") return;
       if (d.type === "M365_PROBE") {
+        post({
+          type: "M365_HOOK_BOOTED",
+          frameOrigin: location.origin,
+        });
         if (frameMayHostSocket()) {
           post({
             type: "M365_FRAME_READY",
+            capabilities: hookState.capabilities,
             frameOrigin: location.origin,
             frameUrl: location.href,
           });
@@ -492,7 +1082,31 @@
             ? w.resolve(_amsTokenCache.token)
             : w.reject(new Error(d.error || "no ams token"));
         }
+      } else if (d.type === "M365_PAGE_TOKEN_PROBE") {
+        probePageToken(d).catch(() => {});
+      } else if (d.type === "M365_KEEPALIVE") {
+        if (typeof d.authHealthy === "boolean") {
+          _veM365AuthHealthy = d.authHealthy;
+        }
+        if (typeof d.rt === "string" && d.rt) {
+          if (d.rt !== _veM365Rt) {
+            _veM365Rt = d.rt;
+            _veM365RtClientId = String(d.rtClientId || "");
+            _veM365RtAt = Date.now();
+          }
+        }
+        if (typeof d.suppressPopups === "boolean") {
+          _veM365SuppressPopups = d.suppressPopups;
+        }
+        touchM365AbtActivity(true);
+        if (d.reauth === true) {
+          try {
+            window.dispatchEvent(new Event("focus"));
+            document.dispatchEvent(new Event("visibilitychange"));
+          } catch (_) {}
+        }
       } else if (d.type === "M365_ASK") {
+        touchM365AbtActivity(false);
         doAsk(
           d.id,
           String(d.text || ""),
@@ -2567,6 +3181,15 @@
       });
       return;
     }
+    try {
+      if (document.documentElement) {
+        document.documentElement.setAttribute("data-ve-m365-hook", "ready");
+      }
+    } catch (_) {}
+    post({
+      type: "M365_HOOK_BOOTED",
+      frameOrigin: location.origin,
+    });
     if (frameMayHostSocket()) {
       post({
         type: "M365_FRAME_READY",
@@ -2577,10 +3200,140 @@
     }
   }
 
+  let pageHookBooted = false;
+
+  function findCspNonce() {
+    try {
+      const el = document.querySelector("script[nonce]");
+      if (!el) return "";
+      return String(el.nonce || el.getAttribute("nonce") || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function injectPageHook(nonce) {
+    if (pageHookBooted) return true;
+    try {
+      const s = document.createElement("script");
+      const resolvedNonce = nonce || findCspNonce();
+      if (resolvedNonce) {
+        s.nonce = resolvedNonce;
+        s.setAttribute("nonce", resolvedNonce);
+      }
+      s.textContent = "(" + PAGE_HOOK.toString() + ")();";
+      (document.head || document.documentElement).appendChild(s);
+      s.remove();
+      if (
+        document.documentElement &&
+        document.documentElement.getAttribute("data-ve-m365-hook") === "ready"
+      ) {
+        pageHookBooted = true;
+        try {
+          document.documentElement.removeAttribute("data-ve-m365-hook");
+        } catch (_) {}
+      }
+      return pageHookBooted;
+    } catch (e) {
+      console.error("[VE-m365] inject failed", e);
+      return false;
+    }
+  }
+
+  function touchAbtFromContentScript(forceServer = true, reauth = false) {
+    if (!pageHookBooted && injectPageHook(findCspNonce())) {
+      return;
+    }
+    const isOffline =
+      typeof navigator !== "undefined" && navigator.onLine === false;
+    let invokedAbt = false;
+    try {
+      const pageWin =
+        (typeof window.wrappedJSObject === "object" &&
+          window.wrappedJSObject) ||
+        null;
+      if (
+        !isOffline &&
+        pageWin &&
+        pageWin.AbtInteraction &&
+        typeof pageWin.AbtInteraction.AbtRegisterActivity === "function"
+      ) {
+        pageWin.AbtInteraction.AbtRegisterActivity(Boolean(forceServer));
+        invokedAbt = true;
+      }
+      if (
+        pageWin &&
+        pageWin.AbtUI &&
+        typeof pageWin.AbtUI.AbtHidePrompt === "function"
+      ) {
+        pageWin.AbtUI.AbtHidePrompt();
+      }
+    } catch (_) {}
+    try {
+      const promptRoot =
+        document.getElementById("abtPrompt") ||
+        document.querySelector("#abtPrompt");
+      if (promptRoot) {
+        const primaryBtn = promptRoot.querySelector(
+          "button.ms-Button--primary, button[class*='PrimaryButton']",
+        );
+        if (primaryBtn && typeof primaryBtn.click === "function") {
+          primaryBtn.click();
+          if (!isOffline) invokedAbt = true;
+        }
+      }
+    } catch (_) {}
+    try {
+      window.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+      if (reauth) {
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      }
+    } catch (_) {}
+    const succeeded = !isOffline && invokedAbt;
+    try {
+      browser.runtime
+        .sendMessage({
+          __veM365: true,
+          type: succeeded ? "M365_SESSION_RENEWED" : "M365_SESSION_RENEW_FAILED",
+          at: Date.now(),
+          frameOrigin: location.origin,
+          invokedAbt,
+          error: isOffline
+            ? "offline"
+            : succeeded
+              ? ""
+              : "page-hook-unready",
+        })
+        .catch(() => {});
+    } catch (_) {}
+  }
+
   // Register relays before injection so PAGE_HOOK's immediate READY cannot race past us.
   window.addEventListener("message", (ev) => {
     const d = ev.data;
     if (!d || d.__veM365 !== true || d.dir !== "fromPage") return;
+    if (d.type === "M365_HOOK_BOOTED") {
+      pageHookBooted = true;
+      try {
+        if (document.documentElement) {
+          document.documentElement.removeAttribute("data-ve-m365-hook");
+        }
+      } catch (_) {}
+      return;
+    }
+    // Never relay auto-login / credential messages from untrusted page scripts.
+    const msgType = String(d.type || "");
+    if (
+      msgType === "M365_GET_AUTO_LOGIN_CONFIG" ||
+      msgType === "M365_STAGE_LOGIN_CREDS" ||
+      msgType === "M365_AUTO_LOGIN_SUBMITTING" ||
+      msgType === "M365_AUTO_LOGIN_RESULT"
+    ) {
+      return;
+    }
     try {
       browser.runtime.sendMessage(d);
     } catch (_) {}
@@ -2588,6 +3341,9 @@
   browser.runtime.onMessage.addListener((msg) => {
     if (!msg || !msg.__veM365ToPage) return;
     const payload = msg.payload || {};
+    if (payload.type === "M365_KEEPALIVE" && !pageHookBooted) {
+      touchAbtFromContentScript(true, payload.reauth === true);
+    }
     window.postMessage(
       Object.assign({ __veM365: true, dir: "toPage" }, payload),
       "*",
@@ -2602,21 +3358,75 @@
     });
   });
 
-  // Inject page world only after the relays exist.
-  try {
-    const s = document.createElement("script");
-    s.textContent = "(" + PAGE_HOOK.toString() + ")();";
-    (document.head || document.documentElement).appendChild(s);
-    s.remove();
-  } catch (e) {
-    console.error("[VE-m365] inject failed", e);
+  // Try immediate injection at document_start; if blocked by a nonce-only CSP
+  // (such as outlook.cloud.microsoft where <script nonce=...> is not yet parsed
+  // at document_start), watch for the first <script nonce> element in <head>
+  // and re-inject with that nonce before deferred OWA/MSAL bundles execute.
+  if (!injectPageHook("")) {
+    window.postMessage(
+      { __veM365: true, dir: "toPage", type: "M365_PROBE" },
+      "*",
+    );
+  }
+  if (!pageHookBooted && typeof MutationObserver === "function") {
+    const obs = new MutationObserver(() => {
+      if (pageHookBooted) {
+        obs.disconnect();
+        return;
+      }
+      const nonce = findCspNonce();
+      if (nonce) {
+        obs.disconnect();
+        injectPageHook(nonce);
+      }
+    });
+    if (document.documentElement) {
+      obs.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+      setTimeout(() => obs.disconnect(), 15000);
+    }
   }
 
-  // Explicit probe covers both fresh injection and extension reload on an existing page hook.
-  window.postMessage(
-    { __veM365: true, dir: "toPage", type: "M365_PROBE" },
-    "*",
+  // The authorize request now uses the redirect_uri captured from OWA's own
+  // token request (that is the only value AAD has registered). The code can
+  // therefore land on the OWA origin itself, not just on oauthRedirect.html, so
+  // report whenever the fragment carries our own ve-reauth state as well.
+  const ourReauthHash = /(?:^|[#&])state=ve-reauth(?:%3A|:)/i.test(
+    String(location.hash || ""),
   );
+  if (/\/oauthRedirect\.html$/i.test(location.pathname) || ourReauthHash) {
+    const reportOAuthRedirectHash = () => {
+      try {
+        const rawHash = String(location.hash || "").replace(/^#/, "");
+        if (!rawHash) return;
+        const hashParams = new URLSearchParams(rawHash);
+        const code = String(hashParams.get("code") || "");
+        const err = String(hashParams.get("error") || "");
+        const errDesc = String(hashParams.get("error_description") || "");
+        const state = String(hashParams.get("state") || "");
+        const clientInfo = String(hashParams.get("client_info") || "");
+        if (!code && !err) return;
+        browser.runtime
+          .sendMessage({
+            __veM365: true,
+            type: "M365_OAUTH_REDIRECT",
+            ok: Boolean(code && !err),
+            code,
+            error: err,
+            errorDescription: errDesc,
+            state,
+            clientInfo,
+            isTopFrame: window === window.top,
+            frameUrl: location.href.split("#", 1)[0],
+          })
+          .catch(() => {});
+      } catch (_) {}
+    };
+    reportOAuthRedirectHash();
+    window.addEventListener("hashchange", reportOAuthRedirectHash);
+  }
 
   if (
     /^https:\/\/outlook\.cloud\.microsoft\/host\/[0-9a-f-]{36}\/entity1-[0-9a-f-]{36}/i.test(
