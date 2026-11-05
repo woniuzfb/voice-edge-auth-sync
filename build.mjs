@@ -9,6 +9,7 @@
  *   node build.mjs all --zip       # build both + zip each
  *   node build.mjs --no-clean      # keep dist/ contents, only overwrite
  *   node build.mjs --no-format     # skip Prettier formatting before build
+ *   node build.mjs --bump <ver>    # bump version (x.y.z|patch|minor|major) + build
  *
  * Layout:
  *   src/                     shared source (background.js is platform-neutral)
@@ -155,11 +156,81 @@ function formatRepo() {
   execSync(`"${bin}" ${mode} .`, { cwd: ROOT, stdio: "inherit" });
 }
 
+function resolveNextVersion(current, spec) {
+  const raw = String(spec || "")
+    .trim()
+    .replace(/^v/i, "");
+  const parts = String(current || "0.0.0")
+    .split(".")
+    .map((n) => Number(n));
+  if (parts.length !== 3 || parts.some((n) => !Number.isInteger(n) || n < 0)) {
+    throw new Error(`invalid current version "${current}"`);
+  }
+  if (raw === "patch") return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+  if (raw === "minor") return `${parts[0]}.${parts[1] + 1}.0`;
+  if (raw === "major") return `${parts[0] + 1}.0.0`;
+  if (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(raw)) return raw;
+  throw new Error(
+    `invalid version "${spec}" (expected x.y.z, patch, minor, or major)`,
+  );
+}
+
+function bumpVersion(spec) {
+  const basePath = join(ROOT, "manifest.base.json");
+  const pkgPath = join(ROOT, "package.json");
+  const lockPath = join(ROOT, "package-lock.json");
+
+  const base = readJSON(basePath);
+  const prevVersion = base.version;
+  const nextVersion = resolveNextVersion(prevVersion, spec);
+
+  base.version = nextVersion;
+  writeFileSync(basePath, JSON.stringify(base, null, 2) + "\n");
+
+  if (existsSync(pkgPath)) {
+    const pkg = readJSON(pkgPath);
+    pkg.version = nextVersion;
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+  }
+
+  if (existsSync(lockPath)) {
+    const lock = readJSON(lockPath);
+    lock.version = nextVersion;
+    if (lock.packages && lock.packages[""]) {
+      lock.packages[""].version = nextVersion;
+    }
+    writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
+  }
+
+  console.log(`✓ bumped version: ${prevVersion} → ${nextVersion}`);
+  return nextVersion;
+}
+
 function main() {
   const args = process.argv.slice(2);
   const doZip = args.includes("--zip");
+  const doBump = args.includes("--bump");
   const positional = args.filter((a) => !a.startsWith("--"));
-  let targets = positional.length ? positional : ["all"];
+
+  if (doBump) {
+    const spec =
+      positional[0] ||
+      process.env.npm_config_ver ||
+      process.env.npm_config_version ||
+      process.env.npm_config_tag ||
+      "";
+    if (!spec) {
+      const cur = readJSON(join(ROOT, "manifest.base.json")).version;
+      console.error(
+        `Current version: ${cur}\nUsage: npm run bump <x.y.z|patch|minor|major> (or --ver=x.y.z)`,
+      );
+      process.exit(1);
+    }
+    bumpVersion(spec);
+  }
+
+  const targetArgs = doBump ? positional.slice(1) : positional;
+  let targets = targetArgs.length ? targetArgs : ["all"];
   if (targets.includes("all")) targets = ["firefox", "chrome"];
 
   formatRepo();

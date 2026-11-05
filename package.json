@@ -1,7 +1,7 @@
 {
   "name": "voice-edge-auth-sync",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.9.0",
   "type": "module",
   "description": "Syncs browser authentication and conversation state for Voice Edge (single source, builds Firefox MV2 + Chrome MV3)",
   "scripts": {
@@ -15,6 +15,7 @@
     "package:chrome": "node build.mjs chrome --zip",
     "package:source": "tar --exclude='dist' --exclude='node_modules' --exclude='.git' --exclude='.DS_Store' -czf voice-edge-auth-sync-source.tar.gz src manifest.base.json manifest.firefox.json manifest.chrome.json build.mjs package.json .prettierrc.json .prettierignore README.md AGENTS.md .github bin test",
     "sign": "node build.mjs firefox && node bin/sign.mjs",
+    "bump": "node build.mjs --bump",
     "release": "tag=${npm_config_tag:?Usage: npm run release --tag=vx.y.z}; git tag \"$tag\" && git push origin \"$tag\"",
     "test:reauth": "node test/reauth.mjs",
     "test:reauth:visual": "node test/reauth.mjs --visual",
