@@ -898,6 +898,7 @@ const POPUP_OPEN_URLS = {
   qwen: "https://chat.qwen.ai/",
   doubao: "https://www.doubao.com/chat/",
   m365: "https://outlook.cloud.microsoft/",
+  aistudio: "https://aistudio.google.com/prompts/new_chat?model=gemini-4-argon",
 };
 
 function popupSafeHost(url) {
@@ -1022,6 +1023,39 @@ function popupBuildState() {
       reauthStateReason: m365ReauthStateReason,
       reauthStateAt: Number(m365ReauthStateAt || 0),
     },
+    aistudio: {
+      bridgeConnected: Boolean(m365Ws && m365Ws.readyState === WebSocket.OPEN),
+      entryUrl: aisEntryUrl,
+      tabId: aisTargetTabId || (aisLastReady && aisLastReady.tabId) || 0,
+      tabUrl: (aisLastReady && aisLastReady.tabUrl) || "",
+      hookReady: Boolean(aisLastReady),
+      service: (aisLastReady && aisLastReady.service) || "pending",
+      timezone: (aisLastReady && aisLastReady.timezone) || "",
+      authOk: Boolean(
+        aisLastReady && aisLastReady.auth && aisLastReady.auth.ok,
+      ),
+      authUser:
+        (aisLastReady && aisLastReady.auth && aisLastReady.auth.authUser) ||
+        "0",
+      tier: (aisLastReady && aisLastReady.auth && aisLastReady.auth.tier) || "",
+      hasApiKey: Boolean(
+        aisLastReady && aisLastReady.auth && aisLastReady.auth.hasApiKey,
+      ),
+      hasExtBin: Boolean(
+        aisLastReady && aisLastReady.auth && aisLastReady.auth.hasExtBin,
+      ),
+      driveStatus:
+        (aisLastReady && aisLastReady.drive && aisLastReady.drive.status) ||
+        "unknown",
+      driveError:
+        (aisLastReady && aisLastReady.drive && aisLastReady.drive.error) || "",
+      driveCheckedAt: Number(
+        (aisLastReady && aisLastReady.drive && aisLastReady.drive.checkedAt) ||
+          0,
+      ),
+      updatedAt: Number((aisLastReady && aisLastReady.updatedAt) || 0),
+      lastError: aisLastError,
+    },
     // Secret-free persistent state reported by Voice Edge (may be null until
     // the async STATE_REPORT arrives). Panel triggers a refresh each poll.
     persistent: lastStateReport,
@@ -1047,10 +1081,22 @@ async function popupSyncDoubao() {
 
 async function popupOpen(provider) {
   const key = String(provider || "");
+  if (key === "aistudio") {
+    try {
+      const tabs = await browser.tabs.query({ url: AIS_TAB_URL_PATTERNS });
+      if (tabs && tabs.length && tabs[0].id != null) {
+        aisTargetTabId = tabs[0].id;
+        await browser.tabs.update(tabs[0].id, { active: true });
+        return { ok: true };
+      }
+    } catch (_) {}
+  }
   const url =
     key === "m365"
       ? m365EntryUrl || POPUP_OPEN_URLS.m365
-      : POPUP_OPEN_URLS[key];
+      : key === "aistudio"
+        ? aisEntryUrl || POPUP_OPEN_URLS.aistudio
+        : POPUP_OPEN_URLS[key];
   if (!url) return { ok: false, error: "未知的 provider" };
   try {
     await browser.tabs.create({ url, active: true });
@@ -1178,7 +1224,14 @@ browser.runtime.onMessage.addListener((message, sender) => {
   }
   if (message.type === "POPUP_GET_STATE") {
     requestBrowserState(false); // refresh persistent state (async)
+    if (!aisLastReady || Date.now() - aisLastPopupPingAt > 30000) {
+      aisLastPopupPingAt = Date.now();
+      pingAisTabs().catch(() => {});
+    }
     return Promise.resolve(popupBuildState());
+  }
+  if (message.type === "POPUP_AIS_PROBE") {
+    return runAisPopupProbe(Boolean(message.warmup));
   }
   if (message.type === "POPUP_SYNC_DOUBAO") return popupSyncDoubao();
   if (message.type === "POPUP_CLEAR_M365_AUTH") {
@@ -1344,7 +1397,7 @@ const M365_SYDNEY_SCOPE = "https://substrate.office.com/sydney/.default";
 // Bumped on every behavioural change that a driver must be able to recognise.
 // The harness prints it on M365_READY, so "did the reload actually take?" is a
 // fact instead of a guess.
-const M365_BUILD_TAG = "2026-10-31T14:18";
+const M365_BUILD_TAG = "2026-11-04T19:20";
 // Audience required by the AMS object endpoint (asyncgw.teams.microsoft.com/
 // v1/objects/…) that serves CodeInterpreter / present_files artifacts. The
 // Sydney token (aud=substrate.office.com/sydney) is REJECTED there with 401 —
@@ -4447,9 +4500,44 @@ function m365Connect() {
       );
       routeM365Stop(message.id);
     }
+    if (message.type === "AIS_CONFIG") {
+      if (message.entryUrl) {
+        aisEntryUrl = String(message.entryUrl).trim() || aisEntryUrl;
+      }
+      aisLastForwardedReadySig = "";
+      if (aisLastReady) {
+        const clean = Object.assign({}, aisLastReady);
+        delete clean.__veAis;
+        delete clean.dir;
+        sendM365(clean);
+      }
+      pingAisTabs().catch(() => {});
+      return;
+    }
+    if (
+      message.type === "AIS_WARMUP" ||
+      message.type === "AIS_CALL" ||
+      message.type === "AIS_STREAM"
+    ) {
+      dispatchAisToTab(message).catch((error) => {
+        sendM365({
+          type: "AIS_ERROR",
+          id: String(message.id || ""),
+          code: "dispatch_failed",
+          message: compactError(error),
+          httpStatus: 503,
+        });
+      });
+      return;
+    }
+    if (message.type === "AIS_ABORT") {
+      routeAisAbort(message.id, message.reason);
+      return;
+    }
   });
   m365Ws.addEventListener("close", () => {
     m365Ws = null;
+    aisLastForwardedReadySig = "";
     scheduleM365Reconnect();
   });
   m365Ws.addEventListener("error", () => {
@@ -4458,6 +4546,186 @@ function m365Connect() {
     } catch (_) {}
   });
   return m365Ws;
+}
+
+const AIS_TAB_URL_PATTERNS = ["https://aistudio.google.com/*"];
+let aisEntryUrl =
+  "https://aistudio.google.com/prompts/new_chat?model=gemini-4-argon";
+let aisTargetTabId = null;
+let aisLastReady = null;
+let aisLastForwardedReadySig = "";
+let aisLastError = null;
+let aisLastPopupPingAt = 0;
+const aisTabByRequestId = new Map();
+
+async function runAisPopupProbe(warmup) {
+  try {
+    const tab = await ensureAisTab();
+    if (!tab || tab.id == null) {
+      return { ok: false, error: "无法打开或定位 AI Studio 标签页" };
+    }
+    const cookies = await readAisAuthCookies();
+    const probeId = "probe-" + Date.now();
+    const beforeTs = (aisLastReady && aisLastReady.updatedAt) || 0;
+    await browser.tabs.sendMessage(
+      tab.id,
+      {
+        __veAisToPage: true,
+        payload: {
+          type: "AIS_PROBE",
+          id: probeId,
+          warmup: Boolean(warmup),
+          cookies,
+        },
+      },
+      { frameId: 0 },
+    );
+    const deadline = Date.now() + (warmup ? 18000 : 4000);
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 150));
+      if (
+        aisLastReady &&
+        (aisLastReady.id === probeId || aisLastReady.updatedAt > beforeTs)
+      ) {
+        break;
+      }
+    }
+    requestBrowserState(true);
+    return {
+      ok: true,
+      state: popupBuildState(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: compactError(error),
+    };
+  }
+}
+
+async function readAisAuthCookies() {
+  const out = {};
+  try {
+    const cookies = await browser.cookies.getAll({
+      url: "https://aistudio.google.com/",
+    });
+    for (const c of cookies || []) {
+      if (
+        c &&
+        (c.name === "SAPISID" ||
+          c.name === "__Secure-1PAPISID" ||
+          c.name === "__Secure-3PAPISID") &&
+        c.value
+      ) {
+        out[c.name] = c.value;
+      }
+    }
+  } catch (_) {}
+  return out;
+}
+
+function pickBestAisTab(tabs) {
+  if (!Array.isArray(tabs) || !tabs.length) return null;
+  const active = tabs.find((t) => t && t.id != null && t.active);
+  if (active) return active;
+  if (aisTargetTabId != null) {
+    const matched = tabs.find((t) => t && t.id === aisTargetTabId);
+    if (matched) return matched;
+  }
+  return tabs.find((t) => t && t.id != null) || null;
+}
+
+async function pingAisTabs() {
+  try {
+    const tabs = await browser.tabs.query({ url: AIS_TAB_URL_PATTERNS });
+    const tab = pickBestAisTab(tabs);
+    if (!tab || tab.id == null) return;
+    const cookies = await readAisAuthCookies();
+    aisTargetTabId = tab.id;
+    browser.tabs
+      .sendMessage(
+        tab.id,
+        {
+          __veAisToPage: true,
+          payload: { type: "AIS_PING", cookies },
+        },
+        { frameId: 0 },
+      )
+      .catch(() => {});
+  } catch (_) {}
+}
+
+async function ensureAisTab() {
+  const tabs = await browser.tabs.query({ url: AIS_TAB_URL_PATTERNS });
+  const chosen = pickBestAisTab(tabs);
+  if (chosen && chosen.id != null) {
+    aisTargetTabId = chosen.id;
+    return chosen;
+  }
+  const created = await browser.tabs.create({
+    url: aisEntryUrl,
+    active: false,
+  });
+  aisTargetTabId = created.id;
+  const cookies = await readAisAuthCookies();
+  // Wait briefly for content script and page hook to load in newly created tab
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      const ack = await browser.tabs.sendMessage(
+        created.id,
+        { __veAisToPage: true, payload: { type: "AIS_PING", cookies } },
+        { frameId: 0 },
+      );
+      if (ack && ack.ok && ack.booted) break;
+    } catch (_) {}
+  }
+  return created;
+}
+
+async function dispatchAisToTab(message) {
+  const tab = await ensureAisTab();
+  if (!tab || tab.id == null) {
+    throw new Error("Unable to locate or open AI Studio tab");
+  }
+  const cookies = await readAisAuthCookies();
+  const payload = Object.assign({}, message, { cookies });
+  const reqId = String(message.id || "");
+  if (reqId) {
+    aisTabByRequestId.set(reqId, tab.id);
+  }
+  const ack = await browser.tabs.sendMessage(
+    tab.id,
+    { __veAisToPage: true, payload },
+    { frameId: 0 },
+  );
+  if (!ack || !ack.ok) {
+    if (reqId) aisTabByRequestId.delete(reqId);
+    throw new Error("AI Studio content script did not acknowledge request");
+  }
+}
+
+function routeAisAbort(id, reason) {
+  const reqId = String(id || "");
+  if (!reqId) return;
+  const tabId = aisTabByRequestId.get(reqId) || aisTargetTabId;
+  aisTabByRequestId.delete(reqId);
+  if (tabId == null) return;
+  browser.tabs
+    .sendMessage(
+      tabId,
+      {
+        __veAisToPage: true,
+        payload: {
+          type: "AIS_ABORT",
+          id: reqId,
+          reason: String(reason || "client-abort"),
+        },
+      },
+      { frameId: 0 },
+    )
+    .catch(() => {});
 }
 
 async function ensureM365Tab() {
@@ -5215,6 +5483,86 @@ function sendToM365Frame(sender, payload) {
 }
 
 browser.runtime.onMessage.addListener((message, sender) => {
+  if (message && message.__veAis === true) {
+    if (sender && sender.tab && sender.tab.id != null) {
+      aisTargetTabId = sender.tab.id;
+    }
+    if (message.type === "AIS_NEED_MAIN_WORLD") {
+      if (
+        sender &&
+        sender.tab &&
+        sender.tab.id != null &&
+        browser.scripting &&
+        typeof browser.scripting.executeScript === "function"
+      ) {
+        browser.scripting
+          .executeScript({
+            target: { tabId: sender.tab.id },
+            world: "MAIN",
+            func: (code) => {
+              try {
+                // eslint-disable-next-line no-eval
+                (0, eval)(code);
+              } catch (_) {}
+            },
+            args: [String(message.code || "")],
+          })
+          .catch(() => {});
+      }
+      return Promise.resolve({ ok: true });
+    }
+    if (
+      message.type === "AIS_READY" ||
+      message.type === "AIS_HEAD" ||
+      message.type === "AIS_CHUNK" ||
+      message.type === "AIS_END" ||
+      message.type === "AIS_ERROR"
+    ) {
+      if (message.type === "AIS_READY") {
+        aisLastReady = Object.assign({}, message, {
+          updatedAt: Date.now(),
+          tabId: (sender && sender.tab && sender.tab.id) || aisTargetTabId || 0,
+        });
+        if (aisLastReady.auth && aisLastReady.auth.ok) {
+          aisLastError = null;
+        }
+        const readySig = JSON.stringify([
+          message.service || "",
+          message.tabUrl || "",
+          message.timezone || "",
+          (message.auth && message.auth.ok) || false,
+          (message.auth && message.auth.authUser) || "",
+          (message.auth && message.auth.tier) || "",
+          (message.auth && message.auth.hasApiKey) || false,
+          (message.auth && message.auth.hasExtBin) || false,
+          (message.auth && message.auth.sapisidHash) || "",
+          (message.drive && message.drive.status) || "",
+        ]);
+        if (!message.id && readySig === aisLastForwardedReadySig) {
+          return Promise.resolve({ ok: true });
+        }
+        aisLastForwardedReadySig = readySig;
+      }
+      if (message.type === "AIS_ERROR") {
+        aisLastError = {
+          code: String(message.code || ""),
+          message: String(message.message || ""),
+          httpStatus: Number(message.httpStatus || 0),
+          at: Date.now(),
+        };
+      }
+      if (message.type === "AIS_END" || message.type === "AIS_ERROR") {
+        const reqId = String(message.id || "");
+        if (reqId) aisTabByRequestId.delete(reqId);
+      }
+      const clean = Object.assign({}, message);
+      delete clean.__veAis;
+      delete clean.dir;
+      sendM365(clean);
+      return Promise.resolve({ ok: true });
+    }
+    return undefined;
+  }
   if (!message || message.__veM365 !== true) return;
   return (async () => {
     if (message.type === "M365_FRAME_READY") {
@@ -5757,6 +6105,23 @@ browser.runtime.onMessage.addListener((message, sender) => {
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
+  if (aisTargetTabId === tabId) {
+    aisTargetTabId = null;
+    aisLastReady = null;
+    aisLastForwardedReadySig = "";
+  }
+  for (const [reqId, tId] of aisTabByRequestId) {
+    if (tId === tabId) {
+      aisTabByRequestId.delete(reqId);
+      sendM365({
+        type: "AIS_ERROR",
+        id: reqId,
+        code: "tab_closed",
+        message: "AI Studio tab was closed while request was in flight",
+        httpStatus: 503,
+      });
+    }
+  }
   for (const [key, frame] of m365FrameCandidates) {
     if (frame.tabId === tabId) m365FrameCandidates.delete(key);
   }

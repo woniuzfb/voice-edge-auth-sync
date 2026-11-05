@@ -5,6 +5,7 @@ const OPEN_URLS = {
   qwen: "https://chat.qwen.ai/",
   doubao: "https://www.doubao.com/chat/",
   m365: "https://m365.cloud.microsoft/",
+  aistudio: "https://aistudio.google.com/prompts/new_chat?model=gemini-4-argon",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -310,6 +311,125 @@ function render(state) {
   setNewButton("m365", anyM365Conversation);
   $("m365-clear-auth").disabled = !m365.authAvailable;
 
+  // ---------------- Google AI Studio ----------------
+  const ais = state.aistudio || {};
+  const aisp = pp.aistudio || {};
+  const aisBridgeOk = Boolean(ais.bridgeConnected || aisp.bridge_connected);
+  const aisAuthOk = Boolean(ais.authOk || aisp.auth_ok);
+  const aisService = String(ais.service || aisp.service || "pending");
+  const aisDriveStatus =
+    ais.driveStatus && ais.driveStatus !== "unknown"
+      ? ais.driveStatus
+      : String(aisp.drive_status || "unknown");
+  const aisDriveErr = String(ais.driveError || aisp.drive_error || "");
+
+  let aisStatusText = "等待页面与登录";
+  let aisStatusCls = "warn";
+  if (!aisBridgeOk) {
+    aisStatusText = "Bridge 未连接";
+    aisStatusCls = "err";
+  } else if (!aisAuthOk) {
+    aisStatusText = ais.hookReady ? "需登录 Google 账号" : "等待打开页面";
+    aisStatusCls = "warn";
+  } else if (aisDriveStatus === "unauthorized") {
+    aisStatusText =
+      aisService === "captured" ? "已就绪 (Drive 未授权)" : "Drive 未授权";
+    aisStatusCls = "warn";
+  } else if (aisService === "captured") {
+    aisStatusText = "已就绪";
+    aisStatusCls = "ok";
+  } else {
+    aisStatusText = "已连接 (待首轮自举)";
+    aisStatusCls = "ok";
+  }
+  setStatus($("ais-status"), aisStatusText, aisStatusCls);
+
+  const aisAcctParts = [];
+  const aisUser = String(ais.authUser || aisp.auth_user || "");
+  if (aisAuthOk && aisUser !== "") {
+    aisAcctParts.push(`/u/${aisUser}`);
+  }
+  const aisTier = String(ais.tier || aisp.tier || "");
+  if (aisTier) {
+    const tierLabel =
+      aisTier === "TIER1"
+        ? "TIER1 (Pro)"
+        : aisTier === "TIER2"
+          ? "TIER2 (Ultra)"
+          : aisTier === "TIER0"
+            ? "TIER0 (Plus)"
+            : aisTier;
+    aisAcctParts.push(tierLabel);
+  }
+  const aisTz = String(ais.timezone || aisp.timezone || "");
+  if (aisTz) aisAcctParts.push(aisTz);
+  setRow("ais-account-row", "ais-account", aisAcctParts.join(" · "));
+
+  const serviceEl = $("ais-service");
+  if (serviceEl) {
+    serviceEl.textContent =
+      aisService === "captured"
+        ? "已捕获 (BotGuard Ready ✓)"
+        : aisAuthOk
+          ? "待捕获 (首轮请求自动静默自举)"
+          : "未就绪";
+  }
+
+  const driveEl = $("ais-drive");
+  if (driveEl) {
+    if (aisDriveStatus === "authorized") {
+      driveEl.textContent = "已授权 ✓ (可同步 Playground History)";
+      driveEl.style.color = "var(--ok)";
+    } else if (aisDriveStatus === "unauthorized") {
+      driveEl.textContent =
+        "未授权 ✗ (请在 AI Studio 页面开启 Drive 保存)" +
+        (aisDriveErr ? ` · ${aisDriveErr}` : "");
+      driveEl.style.color = "var(--warn)";
+    } else {
+      driveEl.textContent = aisAuthOk
+        ? "未检测 (点击下方按钮检测)"
+        : "等待登录";
+      driveEl.style.color = "";
+    }
+  }
+
+  const rawTabUrl = String(ais.tabUrl || aisp.tab_url || "");
+  let shortTab = "";
+  if (rawTabUrl) {
+    try {
+      const uObj = new URL(rawTabUrl);
+      shortTab = uObj.pathname + (uObj.search ? uObj.search.slice(0, 36) : "");
+    } catch (_) {
+      shortTab = rawTabUrl.slice(0, 48);
+    }
+  }
+  setRow("ais-tab-row", "ais-tab", shortTab);
+
+  const aisErrObj = ais.lastError;
+  setRow(
+    "ais-error-row",
+    "ais-error",
+    aisErrObj && aisErrObj.message
+      ? `${aisErrObj.message}${aisErrObj.at ? "｜" + agoText(aisErrObj.at) : ""}`
+      : "",
+  );
+
+  const lastPid = String(aisp.last_prompt_id || "");
+  const lastTitle = String(aisp.last_title || "");
+  const sessCount = Number(aisp.session_count || 0);
+  const dynModels = Number(aisp.dynamic_models_count || 0);
+  setRow(
+    "ais-p-prompt-row",
+    "ais-p-prompt",
+    lastPid ? shortId(lastPid.replace(/^prompts\//, ""), 10) : "",
+  );
+  setRow("ais-p-title-row", "ais-p-title", lastTitle);
+  const metaParts = [];
+  if (sessCount > 0) metaParts.push(`${sessCount} 活跃会话`);
+  if (dynModels > 0) metaParts.push(`${dynModels} 动态模型`);
+  setRow("ais-p-meta-row", "ais-p-meta", metaParts.join(" · "));
+  setNewButton("aistudio", Boolean(sessCount > 0 || lastPid || lastTitle));
+
   const hasUsableCapture = Boolean(cap && cap.complete && !cap.error);
   const captureApplied = hasUsableCapture && db.lastCaptureApplied;
   const btn = $("sync-doubao");
@@ -493,6 +613,59 @@ async function sharePointAction(type) {
   setTimeout(refresh, 300);
 }
 
+async function probeAisStatus() {
+  const btn = $("ais-probe");
+  const hint = $("ais-hint");
+  const original = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "正在检测…";
+  }
+  if (hint) {
+    hint.textContent = "正在检测 AI Studio 页面与 Google Drive OAuth 状态…";
+    hint.className = "ve-hint";
+  }
+  try {
+    const res = await browser.runtime.sendMessage({
+      type: "POPUP_AIS_PROBE",
+      warmup: false,
+    });
+    if (res && res.ok && res.state) {
+      render(res.state);
+      const dSt =
+        (res.state.aistudio && res.state.aistudio.driveStatus) || "unknown";
+      if (hint) {
+        if (dSt === "authorized") {
+          hint.textContent =
+            "Google Drive 已授权 ✓，Playground History 同步正常";
+          hint.className = "ve-hint ok";
+        } else if (dSt === "unauthorized") {
+          hint.textContent =
+            "当前 Google 账号未授权 Google Drive，请在 AI Studio 页面开启 Drive 保存";
+          hint.className = "ve-hint err";
+        } else {
+          hint.textContent = "已刷新 AI Studio 页面状态";
+          hint.className = "ve-hint ok";
+        }
+      }
+    } else if (hint) {
+      hint.textContent = (res && res.error) || "检测失败";
+      hint.className = "ve-hint err";
+    }
+  } catch (err) {
+    if (hint) {
+      hint.textContent = String((err && err.message) || err);
+      hint.className = "ve-hint err";
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = original || "检测 Drive 授权与 WAA 状态";
+    }
+    setTimeout(refresh, 400);
+  }
+}
+
 async function reconnect() {
   try {
     await browser.runtime.sendMessage({ type: "POPUP_RECONNECT" });
@@ -536,6 +709,10 @@ document.addEventListener("DOMContentLoaded", () => {
   $("sp-upload-test").addEventListener("click", () =>
     sharePointAction("POPUP_SP_UPLOAD_TEST"),
   );
+  const aisProbeBtn = $("ais-probe");
+  if (aisProbeBtn) {
+    aisProbeBtn.addEventListener("click", probeAisStatus);
+  }
   for (const b of document.querySelectorAll(".ve-open")) {
     b.addEventListener("click", () =>
       openProvider(b.getAttribute("data-open")),

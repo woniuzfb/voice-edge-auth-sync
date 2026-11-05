@@ -24,7 +24,9 @@
     "https://outlook.office.com/*",
     "https://m365copilotapp.svc.cloud.microsoft/*",
     "https://m365.cloud.microsoft/*",
-    "https://*.sharepoint.com/*"
+    "https://*.sharepoint.com/*",
+    "https://aistudio.google.com/*",
+    "https://alkalimakersuite-pa.clients6.google.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -62,6 +64,12 @@
       "matches": ["https://login.microsoftonline.com/*"],
       "js": ["browser-polyfill.js", "content-m365-login.js"],
       "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://aistudio.google.com/*"],
+      "js": ["browser-polyfill.js", "content-aistudio.js"],
+      "run_at": "document_start",
       "all_frames": false
     }
   ],

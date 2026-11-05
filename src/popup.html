@@ -377,6 +377,71 @@
           清除本地 M365 登录凭证
         </button>
       </article>
+
+      <!-- Google AI Studio -->
+      <article class="ve-card" data-provider="aistudio">
+        <div class="ve-card-head">
+          <span class="ve-card-label">
+            <span class="ve-badge ve-badge-aistudio">AI Studio</span>
+          </span>
+          <span class="ve-status" id="ais-status">—</span>
+          <button class="ve-mini-btn ve-open" data-open="aistudio">打开</button>
+        </div>
+        <dl class="ve-kv">
+          <div id="ais-account-row" hidden>
+            <dt>Google 账号</dt>
+            <dd id="ais-account">—</dd>
+          </div>
+          <div id="ais-service-row">
+            <dt>WAA 签名服务</dt>
+            <dd id="ais-service">—</dd>
+          </div>
+          <div id="ais-drive-row">
+            <dt>Google Drive</dt>
+            <dd id="ais-drive">—</dd>
+          </div>
+          <div id="ais-tab-row" hidden>
+            <dt>活动页面</dt>
+            <dd id="ais-tab">—</dd>
+          </div>
+          <div id="ais-error-row" hidden>
+            <dt>最近错误</dt>
+            <dd id="ais-error">—</dd>
+          </div>
+        </dl>
+        <div class="ve-persist">
+          <div class="ve-persist-head">
+            <span class="ve-persist-title"
+              >Playground History (Voice Edge)</span
+            >
+            <button
+              class="ve-mini-btn ve-new"
+              data-new="aistudio"
+              title="清除内存中的 AI Studio 会话映射，下次请求作为新会话同步"
+            >
+              新建对话
+            </button>
+          </div>
+          <dl class="ve-kv">
+            <div id="ais-p-prompt-row" hidden>
+              <dt>最近 Prompt</dt>
+              <dd id="ais-p-prompt">—</dd>
+            </div>
+            <div id="ais-p-title-row" hidden>
+              <dt>会话标题</dt>
+              <dd id="ais-p-title">—</dd>
+            </div>
+            <div id="ais-p-meta-row" hidden>
+              <dt>运行状态</dt>
+              <dd id="ais-p-meta">—</dd>
+            </div>
+          </dl>
+        </div>
+        <button id="ais-probe" class="ve-secondary-btn">
+          检测 Drive 授权与 WAA 状态
+        </button>
+        <p class="ve-hint" id="ais-hint"></p>
+      </article>
     </main>
 
     <footer class="ve-footer">

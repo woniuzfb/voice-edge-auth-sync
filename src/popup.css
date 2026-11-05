@@ -13,6 +13,7 @@
   --qwen: #7b5cff;
   --doubao: #ff6a3d;
   --m365: #7f5af0;
+  --aistudio: #1a73e8;
 }
 
 * {
@@ -411,4 +412,7 @@ main {
 
 .ve-badge-sharepoint {
   background: #038387;
+}
+.ve-badge-aistudio {
+  background: var(--aistudio);
 }
