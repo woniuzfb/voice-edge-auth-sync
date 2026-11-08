@@ -117,7 +117,15 @@
 
     function detectAuthUserFromUrl() {
       const m = /^\/u\/(\d+)\//.exec(location.pathname || "");
-      return m ? m[1] : "";
+      if (m && m[1]) return m[1];
+      try {
+        const params = new URLSearchParams(location.search || "");
+        const au = params.get("authuser");
+        if (au !== null && /^\d+$/.test(au.trim())) {
+          return au.trim();
+        }
+      } catch (_) {}
+      return "";
     }
 
     function detectApiKeyFromDom() {
@@ -1059,13 +1067,41 @@
       }
     });
 
+    // Canonicalize bare /prompts/... paths without /u/<N>/ to /u/0/prompts/...
+    // so Google multi-account routing, GetLoggingContext, WAA proof, and X-Goog-AuthUser
+    // stay strictly locked to slot 0 instead of falling into an unlinked default session.
+    try {
+      if (
+        location.hostname === "aistudio.google.com" &&
+        /^\/prompts(\/|$)/.test(location.pathname || "") &&
+        !detectAuthUserFromUrl()
+      ) {
+        const targetUrl =
+          location.origin +
+          "/u/0" +
+          location.pathname +
+          (location.search || "") +
+          (location.hash || "");
+        location.replace(targetUrl);
+        return;
+      }
+    } catch (_) {}
+
     try {
       if (document.documentElement) {
         document.documentElement.setAttribute("data-ve-ais-hook", "ready");
       }
     } catch (_) {}
     post({ type: "AIS_HOOK_BOOTED", hookVersion: hookState.version });
-    if (!prevHook && hookState.drive.status === "unknown" && hasAuthCookies()) {
+    if (
+      !prevHook &&
+      hookState.drive.status === "unknown" &&
+      hasAuthCookies() &&
+      Boolean(
+        detectAuthUserFromUrl() ||
+        hookState.headers["x-goog-ext-519733851-bin"],
+      )
+    ) {
       probeDriveAuth(true)
         .catch(() => {})
         .finally(() => {
