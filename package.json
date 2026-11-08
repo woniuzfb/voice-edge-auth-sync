@@ -1,7 +1,7 @@
 {
   "name": "voice-edge-auth-sync",
   "private": true,
-  "version": "1.9.0",
+  "version": "1.9.1",
   "type": "module",
   "description": "Syncs browser authentication and conversation state for Voice Edge (single source, builds Firefox MV2 + Chrome MV3)",
   "scripts": {
