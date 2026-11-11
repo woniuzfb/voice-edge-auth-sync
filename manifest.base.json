@@ -1,6 +1,6 @@
 {
   "name": "Voice Edge Auth Sync",
-  "version": "1.9.1",
+  "version": "2.0.0",
   "description": "Syncs browser authentication and conversation state for Voice Edge.",
   "icons": {
     "16": "icons/icon-16.png",
