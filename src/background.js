@@ -4517,7 +4517,8 @@ function m365Connect() {
     if (
       message.type === "AIS_WARMUP" ||
       message.type === "AIS_CALL" ||
-      message.type === "AIS_STREAM"
+      message.type === "AIS_STREAM" ||
+      message.type === "AIS_UPLOAD"
     ) {
       dispatchAisToTab(message).catch((error) => {
         sendM365({
@@ -4626,13 +4627,22 @@ async function readAisAuthCookies() {
 
 function pickBestAisTab(tabs) {
   if (!Array.isArray(tabs) || !tabs.length) return null;
-  const active = tabs.find((t) => t && t.id != null && t.active);
-  if (active) return active;
+  const valid = tabs.filter((t) => t && t.id != null);
+  if (!valid.length) return null;
+  const isPromptsTab = (t) => String((t && t.url) || "").includes("/prompts/");
+  const activePrompts = valid.find((t) => t.active && isPromptsTab(t));
+  if (activePrompts) return activePrompts;
   if (aisTargetTabId != null) {
-    const matched = tabs.find((t) => t && t.id === aisTargetTabId);
-    if (matched) return matched;
+    const matched = valid.find((t) => t.id === aisTargetTabId);
+    if (matched && (isPromptsTab(matched) || !valid.some(isPromptsTab))) {
+      return matched;
+    }
   }
-  return tabs.find((t) => t && t.id != null) || null;
+  const anyPrompts = valid.find(isPromptsTab);
+  if (anyPrompts) return anyPrompts;
+  const active = valid.find((t) => t.active);
+  if (active) return active;
+  return valid[0] || null;
 }
 
 async function pingAisTabs() {

@@ -428,7 +428,41 @@ function render(state) {
   if (sessCount > 0) metaParts.push(`${sessCount} 活跃会话`);
   if (dynModels > 0) metaParts.push(`${dynModels} 动态模型`);
   setRow("ais-p-meta-row", "ais-p-meta", metaParts.join(" · "));
-  setNewButton("aistudio", Boolean(sessCount > 0 || lastPid || lastTitle));
+  const aisNewPlaygroundBtn = $("ais-new-playground");
+  if (aisNewPlaygroundBtn) {
+    aisNewPlaygroundBtn.disabled = !Boolean(
+      sessCount > 0 || lastPid || lastTitle,
+    );
+  }
+
+  const lastBuildApplet = String(
+    aisp.last_build_applet_id || aisp.last_applet_id || "",
+  );
+  const lastBuildTitle = String(aisp.last_build_title || "");
+  const buildSessCount = Number(aisp.build_session_count || 0);
+  const buildAppletCount = Number(aisp.build_applet_count || 0);
+  setRow(
+    "ais-b-applet-row",
+    "ais-b-applet",
+    lastBuildApplet
+      ? shortId(lastBuildApplet.replace(/^applets\//, ""), 10)
+      : "",
+  );
+  setRow("ais-b-title-row", "ais-b-title", lastBuildTitle);
+  const buildMetaParts = [];
+  if (buildSessCount > 0) buildMetaParts.push(`${buildSessCount} 活跃会话`);
+  if (buildAppletCount > 0)
+    buildMetaParts.push(`${buildAppletCount} 驻留 Applet`);
+  setRow("ais-b-meta-row", "ais-b-meta", buildMetaParts.join(" · "));
+  const aisNewBuildBtn = $("ais-new-build");
+  if (aisNewBuildBtn) {
+    aisNewBuildBtn.disabled = !Boolean(
+      buildSessCount > 0 ||
+      buildAppletCount > 0 ||
+      lastBuildApplet ||
+      lastBuildTitle,
+    );
+  }
 
   const hasUsableCapture = Boolean(cap && cap.complete && !cap.error);
   const captureApplied = hasUsableCapture && db.lastCaptureApplied;

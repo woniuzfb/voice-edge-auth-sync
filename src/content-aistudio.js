@@ -42,11 +42,18 @@
     const prevHook = window.__veAisHook || null;
 
     const MAKERSUITE_HOST = "alkalimakersuite-pa.clients6.google.com";
+    const APPLETS_HOST = "alkalimakersuiteapplets.pa.clients6.google.com";
     const MAKERSUITE_BASE =
       "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService";
     const GENERATE_CONTENT_SUFFIX = "/GenerateContent";
     const COUNT_TOKENS_URL = MAKERSUITE_BASE + "/CountTokens";
     const GENERATE_ACCESS_TOKEN_URL = MAKERSUITE_BASE + "/GenerateAccessToken";
+    const UPLOAD_INIT_URL = "https://aistudio.google.com/_/upload";
+    const TIERED_RPC_SUFFIXES = [
+      "/CodeAssistantOffline",
+      "/GenerateContent",
+      "/CountTokens",
+    ];
     const DRIVE_RPC_SUFFIXES = [
       "/GenerateAccessToken",
       "/ListPrompts",
@@ -266,8 +273,9 @@
       for (const key of Object.keys(makerSuite)) {
         let original;
         try {
-          original = makerSuite[key];
-          if (typeof original !== "function") continue;
+          const candidate = makerSuite[key];
+          if (typeof candidate !== "function") continue;
+          original = candidate.__veAisOriginal || candidate;
           const source = Function.prototype.toString.call(original);
           if (
             !source.includes(".snapshot({") ||
@@ -283,7 +291,7 @@
         hookState.snapshot = function (digest) {
           return original.call(makerSuite, hookState.service, digest);
         };
-        makerSuite[key] = function (...args) {
+        const wrapper = function (...args) {
           const service = args[0];
           if (
             service &&
@@ -297,6 +305,8 @@
           }
           return original.apply(this, args);
         };
+        wrapper.__veAisOriginal = original;
+        makerSuite[key] = wrapper;
         return true;
       }
       return false;
@@ -337,7 +347,8 @@
               }
               if (
                 this.__veAisUrl &&
-                this.__veAisUrl.includes(MAKERSUITE_HOST) &&
+                (this.__veAisUrl.includes(MAKERSUITE_HOST) ||
+                  this.__veAisUrl.includes(APPLETS_HOST)) &&
                 lower in hookState.headers &&
                 val
               ) {
@@ -351,7 +362,10 @@
         XHR.prototype.send = function (body) {
           try {
             const url = String(this.__veAisUrl || "");
-            if (!this.__veAisSynthetic && url.includes(MAKERSUITE_HOST)) {
+            if (
+              !this.__veAisSynthetic &&
+              (url.includes(MAKERSUITE_HOST) || url.includes(APPLETS_HOST))
+            ) {
               const hdrs = this.__veAisReqHeaders || {};
               let changed = false;
               for (const k of Object.keys(hookState.headers)) {
@@ -529,6 +543,65 @@
       throw new Error("Timed out waiting for: " + label);
     }
 
+    function navigateToPlaygroundSpa() {
+      hookState.service = null;
+      hookState.snapshot = null;
+      tryInstallSnapshotHook();
+      try {
+        const navLink =
+          document.querySelector('a[href*="/prompts/new_chat"]') ||
+          Array.from(document.querySelectorAll("a")).find((a) =>
+            /^\s*Playground\s*$/i.test(String(a.textContent || "")),
+          );
+        if (navLink && typeof navLink.click === "function") {
+          navLink.click();
+          return true;
+        }
+      } catch (_) {}
+      try {
+        const u =
+          detectAuthUserFromUrl() ||
+          hookState.headers["x-goog-authuser"] ||
+          "0";
+        const targetPath = `/u/${u}/prompts/new_chat`;
+        if (location.pathname !== targetPath) {
+          history.pushState({}, "", targetPath);
+          window.dispatchEvent(new PopStateEvent("popstate"));
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    async function ensurePromptTextarea(timeoutMs) {
+      const existing = uniqueVisible(
+        "ms-prompt-box textarea",
+        "prompt textarea",
+      );
+      if (existing) return existing;
+      let navigated = false;
+      if (!location.pathname.includes("/prompts/")) {
+        navigated = navigateToPlaygroundSpa();
+      }
+      const startTs = Date.now();
+      const deadline = startTs + (timeoutMs || 10000);
+      while (Date.now() < deadline) {
+        try {
+          dismissKnownOverlays();
+          const area = uniqueVisible(
+            "ms-prompt-box textarea",
+            "prompt textarea",
+          );
+          if (area) return area;
+          if (!navigated && Date.now() - startTs >= 1200) {
+            navigated = navigateToPlaygroundSpa();
+          }
+        } catch (_) {}
+        await sleep(100);
+      }
+      throw new Error("Timed out waiting for: ms-prompt-box textarea");
+    }
+
     async function ensureBootstrapped() {
       if (location.hostname === "accounts.google.com") {
         const err = new Error("Google authentication required on AI Studio");
@@ -554,11 +627,7 @@
       }
       hookState.bootstrapPromise = (async () => {
         try {
-          await waitForCondition(
-            () => uniqueVisible("ms-prompt-box textarea", "prompt textarea"),
-            25000,
-            "ms-prompt-box textarea",
-          );
+          await ensurePromptTextarea(25000);
           await waitForCondition(
             () =>
               performance
@@ -579,10 +648,7 @@
             return;
           }
 
-          const textarea = uniqueVisible(
-            "ms-prompt-box textarea",
-            "prompt textarea",
-          );
+          const textarea = await ensurePromptTextarea(8000);
           if (!textarea) {
             throw new Error("AI Studio prompt textarea not found");
           }
@@ -614,21 +680,15 @@
 
           await interceptPromise;
 
-          // Click Stop if button switched to stop state, then clear textarea
-          for (let i = 0; i < 15; i++) {
-            const stopBtn = uniqueVisible(
-              "ms-run-button button",
-              "Stop button",
-            );
-            if (
-              stopBtn &&
-              stopBtn.querySelector(".spin") &&
-              buttonEnabled(stopBtn)
-            ) {
-              stopBtn.click();
-              break;
-            }
-            await sleep(50);
+          // Yield once for the synthetic XHR error event to settle, then click Stop if still spinning
+          await sleep(20);
+          const stopBtn = uniqueVisible("ms-run-button button", "Stop button");
+          if (
+            stopBtn &&
+            stopBtn.querySelector(".spin") &&
+            buttonEnabled(stopBtn)
+          ) {
+            stopBtn.click();
           }
           const cleanArea = uniqueVisible(
             "ms-prompt-box textarea",
@@ -660,12 +720,17 @@
       const run = async () => {
         await ensureBootstrapped();
         const prompt = normalizeNewlines(rawPagePrompt);
-        const deadline = Date.now() + 5000;
+        const deadline = Date.now() + 8000;
         while (true) {
-          const textarea = uniqueVisible(
+          let textarea = uniqueVisible(
             "ms-prompt-box textarea",
             "prompt textarea",
           );
+          if (!textarea) {
+            textarea = await ensurePromptTextarea(
+              Math.max(1500, deadline - Date.now()),
+            ).catch(() => null);
+          }
           if (!textarea) {
             throw new Error("AI Studio prompt textarea not visible");
           }
@@ -735,7 +800,16 @@
       return parts.join(" ");
     }
 
-    async function buildOrderedRequestHeaders(omitExtBin) {
+    function isTieredRpcUrl(url) {
+      const u = String(url || "");
+      return TIERED_RPC_SUFFIXES.some((suffix) => u.endsWith(suffix));
+    }
+
+    async function buildOrderedRequestHeaders(
+      omitExtBin,
+      targetUrl,
+      includeTierOverride,
+    ) {
       const authHeader = await buildAuthorizationHeader();
       const u = detectAuthUserFromUrl();
       if (u) {
@@ -748,8 +822,15 @@
       if (!hookState.headers["x-aistudio-visit-id"]) {
         hookState.headers["x-aistudio-visit-id"] = generateVisitId();
       }
+      const sendTier =
+        typeof includeTierOverride === "boolean"
+          ? includeTierOverride
+          : isTieredRpcUrl(targetUrl);
       const pairs = [
-        ["X-AIStudio-G1-Tier", hookState.headers["x-aistudio-g1-tier"]],
+        [
+          "X-AIStudio-G1-Tier",
+          sendTier ? hookState.headers["x-aistudio-g1-tier"] : "",
+        ],
         ["X-AIStudio-Visit-Id", hookState.headers["x-aistudio-visit-id"]],
         [
           "X-Goog-Ext-519733851-bin",
@@ -764,7 +845,165 @@
       return pairs.filter(([, val]) => Boolean(String(val || "").trim()));
     }
 
-    // ---- 5. Streaming & Unary XHR Execution ----------------------------------
+    // ---- 5. Streaming, Unary XHR & /_/upload Execution -----------------------
+    function base64ToUint8Array(b64) {
+      const clean = String(b64 || "").replace(/\s+/g, "");
+      const bin = atob(clean);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) {
+        out[i] = bin.charCodeAt(i);
+      }
+      return out;
+    }
+
+    async function decodeBase64ToUint8Array(b64) {
+      const clean = String(b64 || "").replace(/\s+/g, "");
+      if (!clean) return new Uint8Array(0);
+      try {
+        const res = await fetch(
+          "data:application/octet-stream;base64," + clean,
+        );
+        if (res.ok) {
+          return new Uint8Array(await res.arrayBuffer());
+        }
+      } catch (_) {}
+      return base64ToUint8Array(clean);
+    }
+
+    function uint8ArrayToBase64(bytes) {
+      const chunkSize = 0x8000;
+      const chunks = [];
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        chunks.push(
+          String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)),
+        );
+      }
+      return btoa(chunks.join(""));
+    }
+
+    async function sha256Base64(bytes) {
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return uint8ArrayToBase64(new Uint8Array(digest));
+    }
+
+    async function executeAisUpload(msg) {
+      const id = String(msg.id || "");
+      if (!id) return;
+      try {
+        if (location.hostname !== "aistudio.google.com" || !hasAuthCookies()) {
+          const err = new Error("Google authentication required on AI Studio");
+          err.code = "auth_required";
+          err.httpStatus = 401;
+          throw err;
+        }
+        const bytes = await decodeBase64ToUint8Array(
+          msg.dataBase64 || msg.data || "",
+        );
+        const mimeType = String(
+          msg.mimeType || "application/octet-stream",
+        ).trim();
+        const fileName = String(msg.fileName || "attachment").trim();
+        const hashHeader = "sha256=" + (await sha256Base64(bytes));
+        const authUser =
+          detectAuthUserFromUrl() ||
+          hookState.headers["x-goog-authuser"] ||
+          "0";
+
+        const startHeaders = {
+          "X-Goog-Upload-Header-Content-Length": String(bytes.byteLength),
+          "X-Goog-Upload-Header-Content-Type": mimeType,
+          "X-Goog-Hash": hashHeader,
+          "X-Goog-Upload-Protocol": "resumable",
+          "X-Goog-Upload-Command": "start",
+        };
+        if (Number(authUser) > 0) {
+          startHeaders["X-Goog-AuthUser"] = String(authUser);
+        }
+
+        const startRes = await fetch(UPLOAD_INIT_URL, {
+          method: "POST",
+          credentials: "include",
+          headers: startHeaders,
+        });
+        if (!startRes.ok) {
+          const errText = await startRes.text().catch(() => "");
+          const err = new Error(
+            `/_/upload start failed (HTTP ${startRes.status}): ${errText.slice(0, 200)}`,
+          );
+          err.code = "upload_start_failed";
+          err.httpStatus = startRes.status || 502;
+          throw err;
+        }
+        const uploadUrl =
+          startRes.headers.get("x-goog-upload-url") ||
+          startRes.headers.get("X-Goog-Upload-URL") ||
+          "";
+        if (!uploadUrl) {
+          const err = new Error(
+            "/_/upload start response missing X-Goog-Upload-URL",
+          );
+          err.code = "upload_missing_url";
+          err.httpStatus = 502;
+          throw err;
+        }
+
+        const finalizeHeaders = {
+          "Content-Type": mimeType,
+          "X-Goog-Hash": hashHeader,
+          "X-Goog-Upload-Command": "upload, finalize",
+          "X-Goog-Upload-Offset": "0",
+        };
+        if (Number(authUser) > 0) {
+          finalizeHeaders["X-Goog-AuthUser"] = String(authUser);
+        }
+        const finalizeRes = await fetch(uploadUrl, {
+          method: "POST",
+          credentials: "include",
+          headers: finalizeHeaders,
+          body: bytes,
+        });
+        const rawText = (await finalizeRes.text().catch(() => "")).trim();
+        if (!finalizeRes.ok || !rawText) {
+          const err = new Error(
+            `/_/upload finalize failed (HTTP ${finalizeRes.status}): ${rawText.slice(0, 200)}`,
+          );
+          err.code = "upload_finalize_failed";
+          err.httpStatus = finalizeRes.status || 502;
+          throw err;
+        }
+        post({
+          type: "AIS_HEAD",
+          id,
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+        post({
+          type: "AIS_CHUNK",
+          id,
+          seq: 0,
+          data: rawText,
+        });
+        post({
+          type: "AIS_END",
+          id,
+          seq: 1,
+          status: 200,
+          uploadPath: rawText,
+          fileName,
+          mimeType,
+          size: bytes.byteLength,
+        });
+      } catch (err) {
+        post({
+          type: "AIS_ERROR",
+          id,
+          code: String((err && err.code) || "upload_failed"),
+          message: String((err && err.message) || err),
+          httpStatus: Number((err && err.httpStatus) || 502),
+        });
+      }
+    }
+
     async function executeAisRequest(msg) {
       const id = String(msg.id || "");
       if (!id) return;
@@ -791,6 +1030,10 @@
 
         const headerPairs = await buildOrderedRequestHeaders(
           Boolean(msg.omitExtBin),
+          String(msg.url || ""),
+          typeof msg.includeTierHeader === "boolean"
+            ? msg.includeTierHeader
+            : undefined,
         );
         const xhr = new XMLHttpRequest();
         xhr.__veAisSynthetic = true;
@@ -1049,6 +1292,10 @@
               httpStatus: Number((err && err.httpStatus) || 500),
             });
           });
+        return;
+      }
+      if (d.type === "AIS_UPLOAD") {
+        executeAisUpload(d);
         return;
       }
       if (d.type === "AIS_STREAM" || d.type === "AIS_CALL") {

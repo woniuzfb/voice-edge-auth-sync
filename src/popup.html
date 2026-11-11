@@ -415,9 +415,11 @@
               >Playground History (Voice Edge)</span
             >
             <button
+              id="ais-new-playground"
               class="ve-mini-btn ve-new"
               data-new="aistudio"
-              title="清除内存中的 AI Studio 会话映射，下次请求作为新会话同步"
+              data-model="playground"
+              title="清除内存中的 AI Studio Playground 会话映射，下次请求作为新会话同步"
             >
               新建对话
             </button>
@@ -434,6 +436,34 @@
             <div id="ais-p-meta-row" hidden>
               <dt>运行状态</dt>
               <dd id="ais-p-meta">—</dd>
+            </div>
+          </dl>
+        </div>
+        <div class="ve-persist">
+          <div class="ve-persist-head">
+            <span class="ve-persist-title">Build History (Voice Edge)</span>
+            <button
+              id="ais-new-build"
+              class="ve-mini-btn ve-new"
+              data-new="aistudio"
+              data-model="build"
+              title="清除内存中的 AI Studio Build (Applet) 会话映射，下次请求新建 Applet"
+            >
+              新建对话
+            </button>
+          </div>
+          <dl class="ve-kv">
+            <div id="ais-b-applet-row" hidden>
+              <dt>最近 Applet</dt>
+              <dd id="ais-b-applet">—</dd>
+            </div>
+            <div id="ais-b-title-row" hidden>
+              <dt>会话标题</dt>
+              <dd id="ais-b-title">—</dd>
+            </div>
+            <div id="ais-b-meta-row" hidden>
+              <dt>运行状态</dt>
+              <dd id="ais-b-meta">—</dd>
             </div>
           </dl>
         </div>
